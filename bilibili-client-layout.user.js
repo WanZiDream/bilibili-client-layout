@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站客户端双栏布局（评论区移到右侧，边看边刷评）
 // @namespace    https://github.com/WanZiDream/bilibili-client-layout
-// @version      1.4.6
+// @version      1.4.7
 // @description  把B站视频页改成客户端式单屏双栏，可拖拽调宽、边看边评；鼠标停在画面上滚轮可调音量（全屏/网页全屏时播放器的一切都交还B站自带）。
 // @author       0WanZi
 // @license      MIT
@@ -20,53 +20,42 @@
 (function() {
     'use strict';
 
-    /* ================= 调试开关 =================
-       正式使用保持 false；想排查问题时改成 true，控制台只输出 [BCTR] 前缀日志。 */
-    const DEBUG = false;
+    const DEBUG = false; // 正式保持关闭；开启后仅输出 [BCTR] 日志。
     function log()   { if (DEBUG) console.log.apply(console, ['[BCTR]'].concat([].slice.call(arguments))); }
 
-    // B站视频页之间是 SPA 跳转（脚本不会重跑），路由必须每次现读，不能在启动时定死
+    // 页面间是 SPA 跳转，路由须实时读取。
     function isListPage() {
         return window.location.pathname.startsWith('/list/');
     }
 
     const CONFIG = {
         vdconSelector: "#mirror-vdcon",
-        leftContainerSelector: "#mirror-vdcon > div.left-container",
-        playlistLeftContainerSelector: "#mirror-vdcon > div.playlist-container--left",
-        rightContainerSelector: "#mirror-vdcon > div.right-container",
-        playlistRightContainerSelector: "#mirror-vdcon > div.playlist-container--right",
+        leftContainerSelector: "#mirror-vdcon .left-container",
+        playlistLeftContainerSelector: "#mirror-vdcon .playlist-container--left",
+        rightContainerSelector: "#mirror-vdcon .right-container",
+        playlistRightContainerSelector: "#mirror-vdcon .playlist-container--right",
         rightInnerClass: "right-container-inner",
         commentAppSelector: "#commentapp",
-        // B站客户端「补全」的等待上限（毫秒）。补全前搬走 SSR 节点会让B站跳过整段子树，
-        // 评论组件就再也不加载（右栏一片白）。详见 syncPanelContents() 上面的说明。
+        // hydration 前抢走 SSR 节点会导致评论永久空白；超时后只搬简介，绝不碰评论容器。
         shellReadyTimeoutMs: 10000,
-        // 终极兜底（毫秒）：等这么久还没等到评论组件，就只搬简介节点、永远不碰 #commentapp
-        // （组件没挂上就搬它，B站会整页重渲染 → 视频重新加载，比评论区空白更糟）
         shellGiveUpTimeoutMs: 30000,
-        // ⇄ 切换按钮的挂载点：工具条右侧组里的独立一项。
-        // 不能塞进「笔记」按钮内部——「笔记」自己是 inline-flex，多一个 28px 的兄弟
-        // 会把它的文字挤成竖排（真机：窄栏里「笔记」被压到 0 宽）。
+        // 换壳期间保留双栏外观，避免闪回原布局。
+        routeLayoutGraceMs: 3000,
+        // 按钮须独立挂在工具条右侧组；塞进 inline-flex 的「笔记」会挤坏其布局。
         toolbarRightSelector: "#arc_toolbar_report > .video-toolbar-right",
         playlistToolbarRightSelector: "#playlistToolbar > .video-toolbar-right",
-        // /list/ 页的工具条压根没有右侧组（真机实测只有 .video-toolbar-left），退到工具条本体
+        // /list/ 没有右侧组，退回工具条本体。
         toolbarSelector: "#arc_toolbar_report",
         playlistToolbarSelector: "#playlistToolbar",
-        // /list/ 页面要禁用跳转的标题链接。不写死祖先链：①节点会被搬进面板，祖先链就断了
-        // ②.video-info-container 的 .mac/.win 后缀是按操作系统给的（Windows 上是 .win）
+        // 节点会搬入面板，且祖先带系统后缀，不能写死祖先链。
         playlistTitleLinkSelector: ".video-info-title h1 a",
-        // 搬进「简介」选项卡的节点（左栏的信息块）。
-        // /video/ 与 /list/（稍后再看/收藏夹/合集）是两套 DOM，两边的选择器都要列上，
-        // 否则列表页的标题/工具条/简介会被"左栏只留播放器"那条 CSS 推到一屏之外。
+        // /video/ 与 /list/ 的信息节点都要搬入简介，否则会被左栏样式隐藏。
         introMovesFromLeft: [
             ".video-info-container",    // 标题/播放量/发布时间（/video/ 页它就是 #viewbox_report，同一个节点）
             "#arc_toolbar_report",      // 点赞/投币/收藏/分享 工具条（/video/）
             "#playlistToolbar",         // 同上（/list/：工具条换了 id）
             ".video-desc-container",    // 简介正文（/video/ 页它就是 #v_desc，同一个节点）
-            // BGM/音乐入口：真机实测少数视频才有，且是个空挂载点（B站之后往里挂控件）。
-            // 不在名单里就会被"左栏只留播放器"那条 CSS 推成一屏之外（visibility:hidden），
-            // 控件挂上来了也永远看不见。（2026 真机：BV16opg6WELN / BV1popx6zEe1 有）
-            "#bgm-entry",
+            "#bgm-entry", // 延迟挂载的音乐入口也须随简介搬入。
             ".video-tag-container",     // 标签
             ".video-resource-list"      // 附件/资源
         ],
@@ -101,8 +90,7 @@
             //   native      = 浏览器默认
             scrollbarMode: 'overlay'
         },
-        // 滚轮调音量：鼠标停在播放画面上时，滚轮 = 音量加减
-        // （播放器全屏 / 网页全屏 / 浏览器全屏下不接管，交给B站播放器自带的那套）
+        // 播放器画面内滚轮调音量；全屏时交给播放器原生行为。
         wheelVolume: {
             steps: [2, 5, 10, 20],   // 菜单里可循环切换的步长（百分比）
             defaultStep: 5,
@@ -115,17 +103,11 @@
         // 滚轮调音量的生效范围：指针落在这些节点内部才接管，
         // 面板/推荐列表等其它位置的滚轮照常滚动
         playerWheelScope: "#playerWrap, .bpx-player-container, .bpx-player-video-area, #bilibili-player",
-        // 1 秒一次的体检里，几处"查不到就每秒再查一次"的浪费都在这里收口
         healer: {
-            // 负缓存：节点不存在时也记一笔时间戳，这段时间内直接返回 null，不再全文档查询。
-            // 迷你窗、播放器容器、评论组件在不少页面/阶段本来就不存在，旧写法每秒都会白查一次。
-            // 节点"被B站换掉"走的是另一条路（isConnected 变 false），不受负缓存影响。
+            // 缓存不存在的节点，避免体检反复查询；被替换的缓存节点靠 isConnected 失效。
             nodeMissTtlMs: 3000,
-            // 守卫规则（标题/UP主面板/弹幕列表）连续查不到时的重试间隔，单位是 tick 数
             guardRetryTicks: 5,
-            // 守卫规则"曾经认领过、后来丢了"时先快速重试几次，之后才退避：
-            // 这类丢失要尽快自愈，不能一上来就等 5 秒
-            guardFastRetries: 3
+            guardFastRetries: 3 // 已认领节点丢失时先快速自愈，再退避。
         }
     };
 
@@ -137,7 +119,7 @@
     let rememberTab = GM_getValue('rememberTab', false) === true;   // 记住上次页签（默认关，保持"默认评论"）
     let activeTab = (rememberTab && GM_getValue('activeTab', '') === 'intro') ? 'intro' : 'comment';
     let rightPercent = Number(GM_getValue('rightWidthPercent', CONFIG.styleSettings.defaultRightPercent));
-    let layoutStyleEl = null;   // 客户端布局总样式（关闭时清空；宽度也写在这里，值走 CSS 变量）
+    let layoutStyleEl = null;   // 客户端布局总样式（关闭时清空）
     let staticStyleEl = null;   // 常驻样式（拖拽手柄 + 切换按钮），只建一次
     let dragHandle = null;
     let toggleBtn = null;
@@ -146,9 +128,20 @@
     let lastAppliedPercent = null; // 宽度去重：百分比没变就不再写
     let lastWidthHost = null;      // 宽度写在哪个元素上（换容器要重写）
     let appliedTab = '';           // 已经落到 DOM 上的页签，避免每 5 秒重复写 hidden/class
+    let resetCommentScrollOnReady = false;
+    let lastNudgedCommentApp = null;
+    let lastNudgedCommentRoute = '';
     let geoDirty = true;           // 几何脏标记：尺寸变化后才重新量手柄位置/滚动条
     // SPA 路由指纹：path/search 分开存，直接比较两个字段，省掉每秒一次的字符串拼接
     let lastRoutePath = '', lastRouteSearch = '';
+    let routeShellPending = false;
+    let routeOldVdcon = null;
+    let routeOldLeft = null;
+    let routeOldRight = null;
+    let routeOldCommentApp = null;
+    let routeReusedCommentApp = null;
+    let routeShellDeadline = 0;
+    let layoutGraceUntil = 0;
     let tickCount = 0;
     // 拖拽期间预取的几何量：拖拽中每帧只做算术，不读布局
     let dragContentW = 0, dragContentRight = 0;
@@ -198,11 +191,7 @@
         return (elCache[key] = document.getElementById(id));
     }
 
-    /* ---- 负缓存：查不到的节点别每秒再查一遍 ----
-       getMiniPlayerBtn / getVideoEls / getCommentComp / 工具栏挂载点 … 这些节点在不少页面或
-       页面早期阶段根本不存在，旧写法是"查不到 → 下一秒再全文档查一次"，白白每秒烧一次查询。
-       这里给"查询失败"也记一笔时间戳，nodeMissTtlMs 内直接返回空；查到就立刻清掉这笔记录。
-       注意：节点被B站重渲染换掉走的是另一条路（缓存引用 isConnected 变 false），不受负缓存影响。 */
+    // 查询失败也短暂缓存；被替换的节点仍靠 isConnected 失效。
     const nodeMissAt = {
         playerContainer: 0, miniBtn: 0, videoEl: 0, videoEls: 0,
         commentComp: 0, toggleMount: 0, titleLink: 0
@@ -276,6 +265,17 @@
     function getPanel()      { return cachedById('panel',      CONFIG.panelId); }
     function getTabIntro()   { return cachedById('tabIntro',   CONFIG.tabIntroId); }
     function getTabComment() { return cachedById('tabComment', CONFIG.tabCommentId); }
+
+    // 只有完整左右栏和播放器锚点同时存在时才接管页面；模板变化时保留B站原布局，避免锁死滚动。
+    function layoutCanApply() {
+        if (routeShellPending && getVdcon() === routeOldVdcon) return false;
+        const left = getLeftContainer();
+        return !!(getVdcon() && left && getRightContainer() && left.querySelector('#playerWrap'));
+    }
+
+    function layoutVisualsCanApply() {
+        return layoutEnabled && (layoutCanApply() || Date.now() < layoutGraceUntil);
+    }
 
     /* ---- 体检热路径上的节点缓存 ----
        1 秒一次的体检过去会做十几次全文档查询（播放器容器、迷你窗、<video>、bili-comments…），
@@ -386,7 +386,7 @@
     function applyWidths() {
         const right = getRightContainer();
         if (!right) return;
-        const p = layoutEnabled ? clampPercent(rightPercent) : null;
+        const p = layoutVisualsCanApply() ? clampPercent(rightPercent) : null;
         // 面板是 #app 之外的悬浮层，宽度必须由 JS 给（否则 auto 会撑成一整屏）；
         // 这条很轻，放在下面的去重检查之前，保证任何路径进来都能同步到
         const panel = getPanel();
@@ -412,12 +412,9 @@
     // 手柄位置 / 滚动条几何都靠这个标记按需重算，取代"每秒读一次布局"
     function markGeometryDirty() { geoDirty = true; }
 
-    /* 容器尺寸观察：窗口缩放、拖宽、B站自己改尺寸都会让手柄/滚动条失准。
-       以前靠"每秒读一次 getBoundingClientRect + scrollHeight"兜底（每秒一次强制布局），
-       现在改成 ResizeObserver 事件驱动，只在真的变了之后算一次。
-       观察目标变了（B站换容器）才重新 unobserve/observe，避免 ResizeObserver 持有旧节点。 */
+    // ResizeObserver 事件驱动更新几何；换容器时重新观察，避免持有旧节点。
     let layoutRO = null;
-    let observedVdcon = null, observedRight = null;
+    let observedVdcon = null, observedRight = null, observedLeft = null, observedPlayer = null;
 
     function syncLayoutObservers() {
         if (!window.ResizeObserver) return;
@@ -426,19 +423,32 @@
                 geoDirty = true;
                 if (layoutEnabled && !isDragging) positionHandle();
                 if (getScrollbarMode() === 'overlay') updateOverlayScrollbar();
+                if (layoutEnabled && layoutCanApply()) updatePlayerLayout(false);
             }));
         }
         const vdcon = getVdcon();
-        if (vdcon && vdcon !== observedVdcon) {
+        if (vdcon !== observedVdcon) {
             if (observedVdcon) { try { layoutRO.unobserve(observedVdcon); } catch (e) {} }
             observedVdcon = vdcon;
-            try { layoutRO.observe(vdcon); } catch (e) {}
+            if (vdcon) { try { layoutRO.observe(vdcon); } catch (e) {} }
         }
         const right = getRightContainer();
-        if (right && right !== observedRight) {
+        if (right !== observedRight) {
             if (observedRight) { try { layoutRO.unobserve(observedRight); } catch (e) {} }
             observedRight = right;
-            try { layoutRO.observe(right); } catch (e) {}
+            if (right) { try { layoutRO.observe(right); } catch (e) {} }
+        }
+        const left = getLeftContainer();
+        if (left !== observedLeft) {
+            if (observedLeft) { try { layoutRO.unobserve(observedLeft); } catch (e) {} }
+            observedLeft = left;
+            if (left) { try { layoutRO.observe(left); } catch (e) {} }
+        }
+        const player = left && left.querySelector('#playerWrap');
+        if (player !== observedPlayer) {
+            if (observedPlayer) { try { layoutRO.unobserve(observedPlayer); } catch (e) {} }
+            observedPlayer = player;
+            if (player) { try { layoutRO.observe(player); } catch (e) {} }
         }
     }
 
@@ -594,12 +604,9 @@
     // 客户端式双栏总样式（layoutEnabled 为 false 时清空，页面回到B站原样）
     function buildLayoutStyle() {
         layoutStyleEl = styleSlot(layoutStyleEl, 'bctr-layout-style');
-        if (!layoutEnabled) { layoutStyleEl.textContent = ''; return; }
+        if (!layoutVisualsCanApply()) { layoutStyleEl.textContent = ''; return; }
 
-        // 播放器选择器工厂：作用于「普通模式 + 宽屏」（data-screen="normal"/"wide" 或尚未设置该属性）。
-        // 宽屏必须一起接管：宽屏下B站自己的媒体区带内边距、容器按宽高比定高，
-        // 不接管就会露出左右黑缝、播放器高度也不满一屏（2026.09.30.11 实测教训）。
-        // 全屏 full / 网页全屏 web / 小窗 mini 一律不碰，避免和B站自己的模式样式打架。
+        // 普通与宽屏模式接管媒体区；全屏、网页全屏和小窗交给B站。
         const np = (sel) => {
             const s = sel ? ' ' + sel : '';
             return `#playerWrap .bpx-player-container[data-screen="normal"]${s},
@@ -671,6 +678,9 @@
                 }
             `).join('') + innerTransparent;
         }
+        const hiddenLeftInfo = CONFIG.introMovesFromLeft.map((sel) =>
+            `${CONFIG.leftContainerSelector} > ${sel},\n            ${CONFIG.playlistLeftContainerSelector} > ${sel}`
+        ).join(',\n            ');
 
         layoutStyleEl.textContent = `
             /* 单屏化：整页不滚动，像客户端一样一屏放下；
@@ -735,13 +745,8 @@
                 padding: 0 !important;
                 border: 0 !important;
             }
-            /* 左栏里除播放器以外的信息块：移出视野但【保留布局宽度】。
-               ⚠ 不能用 display:none —— B站 changeVideoInfoStyle/handleShowMoreBtn 会读
-               videoInfoTitle.offsetWidth 当作可用宽度 r，量到 0 时它自己的折叠算法会越界
-               （l[p] 被减到 -1 → l[-1].style 抛 TypeError），异常会让B站整页重渲染：
-               播放器被重建、视频重新加载一次，肉眼就是"闪一下又从头加载"。 */
-            ${CONFIG.leftContainerSelector} > *:not(#playerWrap),
-            ${CONFIG.playlistLeftContainerSelector} > *:not(#playerWrap) {
+            /* 已知信息块仅移出视野并保留宽度；display:none 会触发B站宽度测量越界和整页重渲染。 */
+            ${hiddenLeftInfo} {
                 position: absolute !important;
                 left: -20000px !important;
                 top: 0 !important;
@@ -757,13 +762,7 @@
                 margin: 0 !important;
                 padding: 0 !important;
             }
-            /* 播放器箱体撑满左栏：宽度100%、高度100%，视频由 object-fit 自行留边。
-               整条链路（player/docker/container/媒体区/视频）的 margin/padding/border 全部清零：
-               B站个别层自带几像素内边距或边框，会在画面左右露出两条黑缝（容器底色透出来），
-               清零后画面才真正贴到左栏边缘。
-               ⚠ 这两层和 .bpx-player-container 是【祖先→后代】关系（子选择器 np() 够不到），
-               所以用 JS 镜像出来的 html.bctr-player-fs 反选：全屏 / 网页全屏 / 小窗下B站自己排版，
-               脚本连 width/height/padding/transform 都不碰，免得把B站全屏的定位与内边距一起压掉。 */
+            /* 清零播放器链路的内边距/边框以免露黑缝；全屏和小窗不碰祖先层，保留B站排版。 */
             html:not(.${FS_CLASS}) #playerWrap #bilibili-player {
                 width: 100% !important;
                 height: 100% !important;
@@ -778,12 +777,7 @@
                 width: 100% !important;
                 ${ZERO}
             }
-            /* 媒体区尺寸彻底交给CSS：.bpx-player-primary-area 是列向 flex 容器，
-               子项 .bpx-player-video-area 的 flex:1 1 0% 会让 flex-basis 在主轴(高度)上
-               盖过 height:100%，画面大小就仍由播放器自己那套（会睡着的）计算决定——
-               左栏拉到很宽时画面停止跟随、上下留黑边。这里把整条媒体链改成 block/100%，
-               控制条改为贴底悬浮（全屏模式本来就是这个形态），画面 = contain(整个容器)，
-               永远跟着左栏尺寸走，与播放器JS是否重排无关。 */
+            /* 媒体链改用 block/100%，控制条悬浮贴底，避免播放器 JS 休眠后画面不随左栏缩放。 */
             ${np('.bpx-player-primary-area')} {
                 display: block !important;
                 width: 100% !important;
@@ -799,16 +793,12 @@
                 aspect-ratio: auto !important;
                 ${ZERO}
             }
-            /* 控制条不用我们摆位：实测（2026 真机）当前播放器的控制层是 .bpx-player-control-wrap，
-               旧的 .bpx-player-control-bar 在 normal/wide/web/full/mini 五种模式下都不存在；
-               B站自己就把控制层写成 absolute 贴底，所以这里不需要任何规则。 */
+            /* 控制层由B站 absolute 贴底，无需脚本摆位。 */
             /* 弹幕发送条原本在媒体区下方占一行（全屏模式本来就没有它），单屏布局里隐藏 */
             ${np('.bpx-player-sending-bar')} {
                 display: none !important;
             }
-            /* 视频元素本身铺满媒体区：B站会给 <video> 写内联像素尺寸，
-               布局/模式变化后那份尺寸常常是过期的，表现为画面缩在左上、右下留黑边。
-               强制 100% 后由 object-fit 自行留边，任何状态下都不会错位。 */
+            /* 覆盖B站可能过期的内联视频尺寸，统一 contain 留边。 */
             #playerWrap .bpx-player-video-area video {
                 width: 100% !important;
                 height: 100% !important;
@@ -825,8 +815,8 @@
                 margin-left: 0 !important;
                 pointer-events: auto !important;
             }
-            ${CONFIG.rightContainerSelector} > .${CONFIG.rightInnerClass},
-            ${CONFIG.playlistRightContainerSelector} > .${CONFIG.rightInnerClass} {
+            ${CONFIG.rightContainerSelector} .${CONFIG.rightInnerClass},
+            ${CONFIG.playlistRightContainerSelector} .${CONFIG.rightInnerClass} {
                 display: none !important;
             }
             /* 面板本体：悬浮在 #app 之外（见 ensurePanel），盖在右栏位置上 */
@@ -920,11 +910,7 @@
                 height: auto !important;
                 min-height: 0 !important;
             }
-            /* 工具条在窄栏里必须能换行：B站给 .video-toolbar-left-item 写死 92px，
-               四项 + 8px 间距 = 400px，比 25% 宽度的面板内容区（约 360px）还宽；
-               容器是 flex + space-between 且不换行，右侧组（举报/笔记/更多/⇄）就被整段
-               推到面板外面，同时右侧文字被压成竖排（真机实测：右组落在 x=1564，面板只到 1536）。
-               这里让两组各自可换行、按钮项不许被压缩、文字不许断行。 */
+            /* 窄栏工具条允许两组换行，按钮不压缩、文字不断行。 */
             #${CONFIG.tabIntroId} .video-toolbar-container {
                 flex-wrap: wrap !important;
                 row-gap: 8px !important;
@@ -979,16 +965,7 @@
                 height: auto !important;
                 max-height: 45vh !important;
             }
-            /* 评论页签：把「滚动容器」交给 #commentapp 本身，而不是外层 tabbody。
-               原因（真机逆向 + 实测）：B站评论组件 bili-comments 初始化/重连时会自检
-               this.parentElement 的 overflow-y，只有父元素可滚动才把它记成 scrollContainer，
-               之后"滚动到底加载更多"就监听这个容器；否则退化成监听 window 滚动。
-               本布局把 window 钉死（html/body overflow:hidden），一旦退化成 window 路径，
-               评论区就永远不翻页（真机复现：上万条评论的视频也只显示首屏、下滑不再加载）。
-               把 #commentapp 设成滚动容器后，组件重连时会把它认作 scrollContainer，
-               翻页监听挂在它身上 —— 用户滚它 = 正常翻页。
-               （左右各 4px 内边距从原 tabbody 搬到这里：收敛评论区左侧空白；
-                 评论正文在 <bili-comments> 的 Shadow DOM 里，另有 shadow 样式注入。） */
+            /* 评论组件只把可滚动父元素认作 scrollContainer；window 被锁死时必须由 #commentapp 承接翻页监听。 */
             #${CONFIG.tabCommentId} {
                 display: flex !important;
                 flex-direction: column !important;
@@ -1053,9 +1030,11 @@
         target.appendChild(node);
     }
 
-    function restoreAllMoved() {
+    function restoreAllMoved(scope) {
         movedOrigin.forEach((rec, node) => {
             if (!document.body.contains(node)) return;
+            if (scope && !((scope.left && (scope.left === rec.parent || scope.left.contains(rec.parent)))
+                || (scope.right && (scope.right === rec.parent || scope.right.contains(rec.parent))))) return;
             if (rec.parent && document.body.contains(rec.parent)) {
                 const next = rec.next && rec.next.parentNode === rec.parent ? rec.next : null;
                 rec.parent.insertBefore(node, next);
@@ -1074,8 +1053,7 @@
     function ensurePanel() {
         if (!layoutEnabled) return null;
         return safeDOMOperation(() => {
-            const rc = getRightContainer();
-            if (!rc) return null;
+            if (!layoutCanApply()) return null;
 
             let panel = getPanel();
             if (!panel) {
@@ -1106,8 +1084,7 @@
                 });
                 // Home/End 切页签；左右方向键不拦截，留给B站播放器快进/后退。
                 bar.addEventListener('keydown', (e) => {
-                    const keys = ['Home', 'End'];
-                    if (keys.indexOf(e.key) === -1) return;
+                    if (e.key !== 'Home' && e.key !== 'End') return;
                     const tabs = Array.from(bar.querySelectorAll('.bctr-tab'));
                     if (!tabs.length) return;
                     e.preventDefault();
@@ -1118,8 +1095,6 @@
                     switchTab(tabs[i].getAttribute('data-tab'));
                     tabs[i].focus();
                 });
-            } else if (!panel.isConnected) {
-                (document.body || document.documentElement).appendChild(panel);   // 被B站重渲染吞掉就补回来
             }
             initOverlayScrollbar(panel);
             syncLayoutObservers();          // 容器可能换了，重新对齐观察目标
@@ -1128,9 +1103,7 @@
         });
     }
 
-    // 全量搬移：把简介/评论节点搬进面板并登记。
-    // 只在首帧、SPA 路由变化、体检失败、以及每 5 秒兜底时执行——
-    // 旧版是每秒无脑重扫 10 个全文档选择器再重设一遍页签状态，纯属浪费。
+    // 仅在首帧、路由变化、体检失败及低频兜底时全量搬移。
     function syncPanelContents() {
         const intro = getTabIntro();
         const commentBody = getTabComment();
@@ -1152,10 +1125,11 @@
         shellInjectionOk = true;      // 补全已完成：可以往B站容器里插 ⇄ 按钮 / 拖拽手柄了
 
         trackedMoves.length = 0;
+        const scope = getVdcon();
         if (gate.intro) {
             removeWaitHint(getTabIntro());
             for (const sel of introSelectors) {
-                const node = document.querySelector(sel);
+                const node = scope ? scope.querySelector(sel) : null;
                 if (!node) continue;                     // 这个视频没有该信息块
                 // 已经在面板里的节点（含被搬进来的外壳的后代）不再单独搬一次：
                 // /video/ 页 #danmukuBox 就在 .video-pod-above-modules 内部，
@@ -1166,11 +1140,16 @@
             }
         }
         if (gate.comment) {
-            const commentApp = pickCommentApp();
+            const commentApp = gate.commentApp;
             if (commentApp) {
-                moveNodeInto(commentApp, commentBody);
-                trackedMoves.push({ node: commentApp, target: commentBody });
+                const needsLazyNudge = commentApp.parentNode !== commentBody || resetCommentScrollOnReady;
+                moveCommentAppIntoPanel(commentApp, commentBody);
+                if (resetCommentScrollOnReady) {
+                    if (commentApp !== routeOldCommentApp) commentApp.scrollTop = 0;
+                    resetCommentScrollOnReady = false;
+                }
                 removeWaitHint(commentBody);
+                if (needsLazyNudge) triggerCommentLazyLoad();
             }
         }
 
@@ -1179,33 +1158,24 @@
         syncCommentShadowStyle();
     }
 
-    /* ================= 搬迁时机：等B站补全（关键修复） =================
-       B站新版视频页是「SSR 直出 HTML + 客户端按位补全」：补全脚本拿着 vnode 树
-       和直出的 DOM 逐个对位认领。我们要搬的节点（#viewbox_report / #arc_toolbar_report
-       / #v_desc / .video-tag-container …）都排在 .left-container 里 #commentapp 的前面，
-       而评论组件是这一列的最后一个组件。
-       一旦抢在补全之前把它们搬走，对位就从第一个缺口开始错位，B站会整段放弃——
-       window.BiliComments 永远不加载、#commentapp 永远是个空 div，而且不会再重试，
-       右栏就永久空白（实测：延迟补全脚本 7 秒，100% 复现；不搬节点则一切正常）。
-       症状上表现为「有时正常、有时评论区空白」，本质是脚本 1 秒一次的体检
-       和B站补全（几百毫秒~数秒）之间的竞态。
-       所以：补全完成前只建面板、不搬节点，并给出「加载中」提示；补全一完成立刻搬。 */
+    /* 等B站 hydration：评论组件是左栏最后一项，提前搬走前面的 SSR 节点会使后续对位错乱，
+       B站会放弃加载评论且不重试。因此评论组件挂载前只建面板并显示提示，不搬任何页面节点。 */
     function movesGate() {
-        const ca = document.querySelector(CONFIG.commentAppSelector);
+        const ca = pickCommentApp();
         // 页面里压根没有评论容器（评论关闭 / 模板不同）：没什么可等的
-        if (!ca) return { intro: true, comment: true };
-        // 评论组件已经挂进 #commentapp：B站的对位走完了，随便搬
-        if (ca.firstElementChild) return { intro: true, comment: true };
+        if (!ca) return { intro: true, comment: true, commentApp: null };
+        // 评论自定义元素已经挂进 #commentapp：B站的对位走完了，随便搬
+        if (ca.querySelector('bili-comments')) return { intro: true, comment: true, commentApp: ca };
 
         const now = Date.now();
         if (!shellDeadline) shellDeadline = now + CONFIG.shellReadyTimeoutMs;
         if (!shellHardDeadline) shellHardDeadline = now + CONFIG.shellGiveUpTimeoutMs;
         // ① 等够 shellReadyTimeoutMs，且完全看不出"评论组件正在赶来"→ 这页不会挂评论组件
-        if (now >= shellDeadline && !commentComponentComing()) return { intro: true, comment: true };
+        if (now >= shellDeadline && !commentComponentComing()) return { intro: true, comment: true, commentApp: ca };
         // ② 再等到 shellGiveUpTimeoutMs：可以搬简介，但绝不碰 #commentapp
         //    （组件没挂上就搬它 = B站整页重渲染 = 视频重新加载，比"评论空白"更糟）
-        if (now >= shellHardDeadline) return { intro: true, comment: false };
-        return { intro: false, comment: false };
+        if (now >= shellHardDeadline) return { intro: true, comment: false, commentApp: ca };
+        return { intro: false, comment: false, commentApp: ca };
     }
 
     // 有没有"B站正在加载评论组件"的迹象（脚本标签 / 全局构造器 / 自定义元素）
@@ -1216,11 +1186,33 @@
         return false;
     }
 
-    // 有多个 #commentapp 时（B站偶尔会另建一个），优先搬真正装了评论组件的那个
+    // 当前壳里的评论容器优先；已经搬进面板的容器只在壳里没有容器时作为兜底。
+    // 这样路由过渡期间，面板里的旧评论不会把新壳误判成 hydration 已完成。
     function pickCommentApp() {
-        const all = document.querySelectorAll(CONFIG.commentAppSelector);
-        for (const el of all) if (el.firstElementChild) return el;
-        return all[0] || null;
+        const scope = getVdcon();
+        const inShell = scope ? scope.querySelectorAll(CONFIG.commentAppSelector) : [];
+        if (inShell.length) return selectCommentApp(inShell);
+        const commentBody = getTabComment();
+        return commentBody ? selectCommentApp(commentBody.querySelectorAll(CONFIG.commentAppSelector)) : null;
+    }
+
+    function selectCommentApp(apps) {
+        for (const el of apps) if (el.querySelector('bili-comments')) return el;
+        for (const el of apps) if (el.firstElementChild) return el;
+        return apps[0] || null;
+    }
+
+    function moveCommentAppIntoPanel(commentApp, commentBody) {
+        let replaced = false;
+        commentBody.querySelectorAll(CONFIG.commentAppSelector).forEach((el) => {
+            if (el === commentApp) return;
+            el.remove();
+            replaced = true;
+        });
+        if (replaced) clearCommentShadowState();
+        moveNodeInto(commentApp, commentBody);
+        trackedMoves.push({ node: commentApp, target: commentBody });
+        if (commentApp !== routeReusedCommentApp) routeReusedCommentApp = null;
     }
 
     // 等待期间还没搬内容的页签放一条提示，免得被当成脚本坏了
@@ -1230,7 +1222,7 @@
             const el = document.createElement('div');
             el.className = 'bctr-wait-hint';
             el.textContent = waitingHintText();
-            body.appendChild(el);
+            body.prepend(el);
         }
     }
 
@@ -1273,7 +1265,7 @@
             const commentBody = getTabComment();
             if (!intro || !commentBody) return;
             const next = (name === 'intro') ? 'intro' : 'comment';
-            // DOM 已经是目标状态就一行都不写（旧版每 5 秒的兜底重扫都会白写一遍 hidden/class）
+            // 已同步时不重复写 hidden/class。
             const inSync = appliedTab === next
                 && intro.hidden === (next !== 'intro')
                 && commentBody.hidden === (next !== 'comment');
@@ -1289,8 +1281,7 @@
                     const on = t.getAttribute('data-tab') === next;
                     t.classList.toggle('active', on);
                     t.setAttribute('aria-selected', on ? 'true' : 'false');
-                    // 只让当前页签可 Tab 进入，方向键在内部循环（原生 tablist 行为）
-                    t.tabIndex = on ? 0 : -1;
+                    t.tabIndex = on ? 0 : -1; // 仅当前页签进入 Tab 顺序。
                 });
             }
             if (next === 'comment') triggerCommentLazyLoad();
@@ -1300,49 +1291,86 @@
         });
     }
 
-    function teardownPanel() {
+    function resetPanelForRoute(restoreScope) {
         safeDOMOperation(() => {
-            restoreAllMoved();
+            routeReusedCommentApp = null;
+            const commentBody = getTabComment();
+            const previousCommentApp = commentBody && commentBody.querySelector(CONFIG.commentAppSelector);
+            restoreAllMoved(restoreScope);
+            resetShellState();
+            movesPending = true;
+            appliedTab = '';
+            const intro = getTabIntro();
+            if (intro) intro.replaceChildren();
+            let preservedCommentApp = false;
+            if (commentBody) {
+                if (previousCommentApp && previousCommentApp.isConnected
+                    && getVdcon() && getVdcon().contains(previousCommentApp)) {
+                    moveNodeInto(previousCommentApp, commentBody);
+                    routeReusedCommentApp = previousCommentApp;
+                    preservedCommentApp = true;
+                } else {
+                    commentBody.replaceChildren();
+                }
+            }
+            if (preservedCommentApp) syncCommentShadowStyle();
+            else clearCommentShadowState();
+            ensureWaitHint();
+            switchTab(activeTab, true);
+            updateOverlayScrollbar();
+        });
+    }
+
+    function teardownPanel(restoreScope) {
+        safeDOMOperation(() => {
+            restoreAllMoved(restoreScope);
             resetShellState();
             appliedTab = '';
             const panel = getPanel();
             if (panel) panel.remove();
+            if (dragHandle) {
+                dragHandle.remove();
+                dragHandle = null;
+                dragBubble = null;
+            }
+            clearCommentShadowState();
             elCache.panel = elCache.tabIntro = elCache.tabComment = null;
         });
     }
 
-    // 触发评论懒加载
-    // 注意：这里绝对不能用 scrollIntoView —— 它会连带滚动 document（本布局给 html/body
-    // 设了 overflow:hidden，滚下去用户也滚不回来），一旦播放器被判定"滚出视口"，
-    // B站就会自动开启画中画/迷你播放器，主播放区变黑。只滚动我们自己的页签容器。
+    // 不能 scrollIntoView：它会滚动 document，触发播放器离屏小窗；只滚动评论容器。
     function triggerCommentLazyLoad() {
         const commentBody = getTabComment();
         if (!commentBody) return;
         const commentApp = commentBody.querySelector(CONFIG.commentAppSelector);
         if (!commentApp) return;                       // 还没搬进面板，什么都不做
-        if (commentApp.querySelector('bili-comments')) return; // 评论组件已挂载
+        if (activeTab !== 'comment' || commentBody.hidden) return;
 
-        // 评论页签的滚动器是 #commentapp（见布局样式注释），滚动/派发都按它来
+        // 自定义元素挂载不等于评论数据已加载，主动触发一次滚动让B站尽快开始懒加载。
+        // 同一条路由只唤醒一次，避免定时体检或重复切页签把用户正在看的位置拉回顶部。
+        const routeKey = lastRoutePath + lastRouteSearch;
+        if (commentApp === lastNudgedCommentApp && routeKey === lastNudgedCommentRoute) return;
+        lastNudgedCommentApp = commentApp;
+        lastNudgedCommentRoute = routeKey;
         const scroller = getCommentScroller() || commentBody;
-        scroller.scrollTop = 0;
         scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+        requestAnimationFrame(() => {
+            if (commentApp.isConnected && activeTab === 'comment' && !commentBody.hidden) {
+                scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+            }
+        });
     }
 
-    /* ================= 评论 Shadow DOM 样式注入 =================
-       评论正文渲染在 <bili-comments> 的 Shadow DOM 里，页面级 CSS 完全够不着。
-       实测 shadow 内唯一带左内边距的节点是 <bili-comment-box>（padding-left:80px），
-       窄栏里这 80px 就是评论区左侧那大片空白。shadow root 是 open 的，可直接塞 <style>。
-       B站重渲染可能把我们的 <style> 冲掉，所以做成幂等自愈：每秒体检时缺了就补。 */
+    /* 评论正文在 Shadow DOM 中；向 open root 注入样式压缩 80px 左内边距，并在重渲染后自愈。 */
     let shadowStyleEl = null;   // 注入评论 shadow 的 <style>：缓存后常态只剩一次属性读
+    let observedShadowRoot = null;
+    let lastShadowScanAt = 0;
+    const shadowObservers = new Map();
+    const actionRoots = new Set();
+    let openActionMenu = null;
 
-    /* 「回复」两字在窄栏里被压成竖排：按钮属于 bili-comment-action-buttons-renderer，
-       它嵌在 bili-comments → thread-renderer → comment-renderer 之下（共 4 层 shadow），
-       上面那份 <style> 一层也穿不透，只能走到它自己的 root 再塞一份。
-       组件自带样式是 :host{display:flex} + :host>*:not(:first-child){margin-left:20px}，
-       文字没禁断行 → 宽度不够时按钮先被压缩、再逐字折行。
-       这里收紧间距、禁止断行，并允许整行换行兜底（宁可换行，不要竖排）。
-       ⚠ 不能改成 patch attachShadow：@grant 让脚本跑在隔离世界，原型补丁主世界看不到
-         （同 requestPictureInPicture 那段结论）。DOM 是跨世界共享的，所以塞 <style> 有效。 */
+    /* 操作按钮位于多层 shadow，须单独注入：收紧间距、禁止文字竖排，并允许整行换行。
+       隔离世界 patch 不到页面原型，但能共享 DOM 并插入样式。 */
     const ACTION_TAG = 'bili-comment-action-buttons-renderer';
     const ACTION_STYLE_ID = 'bctr-action-style';
     const ACTION_CSS = `
@@ -1350,27 +1378,12 @@
         :host > * { white-space: nowrap !important; }
         :host > *:not(:first-child) { margin-left: 12px !important; }
         button { flex: 0 0 auto !important; }
-        #more { margin-right: 0 !important; }
+        :host > :last-child { margin-right: 0 !important; }
     `;
     // 按 root 记住塞进去的那份样式：常态每个 root 只剩一次 isConnected 读。
     // 用 WeakMap 而不是 Set，评论翻篇后 root 能被回收（不会拖着一整棵卸载的 DOM）
     const actionStyles = new WeakMap();
-    let actionStyleActive = false;   // 塞过没有：关闭布局时按它决定要不要走一遍清理
-
-    // 遍历评论子树里的每一层 shadow root，对动作条的 root 执行 fn
-    function eachActionRoot(sr, fn) {
-        const stack = [sr];
-        while (stack.length) {
-            const root = stack.pop();
-            for (const el of root.querySelectorAll('*')) {
-                if (el.localName === ACTION_TAG) {
-                    fn(el.shadowRoot);
-                } else if (el.shadowRoot) {
-                    stack.push(el.shadowRoot);   // 只有自定义元素才有 root，普通 div 这里直接是 null
-                }
-            }
-        }
-    }
+    const actionMenus = new WeakMap();
 
     function injectActionStyle(root) {
         if (!root) return;
@@ -1383,33 +1396,201 @@
         actionStyles.set(root, st);
     }
 
+    function observeShadowRoot(root) {
+        if (!root || shadowObservers.has(root)) return;
+        const observer = new MutationObserver((records) => {
+            const added = [];
+            for (const record of records) {
+                for (const node of record.addedNodes) if (node.nodeType === 1) added.push(node);
+            }
+            if (added.length) {
+                resetSbGeom();
+                scanShadowNodes(added);
+            }
+        });
+        observer.observe(root, { childList: true, subtree: true });
+        shadowObservers.set(root, observer);
+    }
+
+    // 只遍历本次新增节点及其后代；遇到 open shadow root 时继续向内观察。
+    function scanShadowNodes(nodes) {
+        const stack = Array.from(nodes);
+        while (stack.length) {
+            const el = stack.pop();
+            if (!el || el.nodeType !== 1) continue;
+            if (el.localName === ACTION_TAG && el.shadowRoot) registerActionRoot(el.shadowRoot);
+            if (el.shadowRoot) {
+                observeShadowRoot(el.shadowRoot);
+                for (const child of el.shadowRoot.children) stack.push(child);
+            }
+            for (const child of el.children) stack.push(child);
+        }
+    }
+
+    function registerActionRoot(root) {
+        if (!root) return;
+        actionRoots.add(root);
+        observeShadowRoot(root);
+        if (layoutEnabled && activeTab === 'comment') {
+            injectActionStyle(root);
+            bindActionMenu(root.host, root);
+        }
+    }
+
+    function syncActionRoots() {
+        for (const root of Array.from(actionRoots)) {
+            if (!root.host || !root.host.isConnected) {
+                forgetActionRoot(root);
+                continue;
+            }
+            injectActionStyle(root);
+            bindActionMenu(root.host, root);
+        }
+    }
+
+    function isInsideActionMenu(node, boundary, menu) {
+        let el = node && node.nodeType === 1 ? node : null;
+        while (el) {
+            if (el === boundary || el === menu) return true;
+            const root = el.getRootNode ? el.getRootNode() : null;
+            el = root && root.host ? root.host : null;
+        }
+        return false;
+    }
+
+    function closeActionMenu(record) {
+        if (!record) return;
+        record.host.showMoreMenu = false;
+        if (openActionMenu === record) openActionMenu = null;
+    }
+
+    function unbindActionMenu(root) {
+        const prev = actionMenus.get(root);
+        if (!prev) return;
+        prev.boundary.removeEventListener('mouseleave', prev.leave);
+        prev.trigger.removeEventListener('click', prev.open);
+        prev.menu.removeEventListener('select', prev.close);
+        closeActionMenu(prev);
+        actionMenus.delete(root);
+    }
+
+    function forgetActionRoot(root) {
+        unbindActionMenu(root);
+        const observer = shadowObservers.get(root);
+        if (observer) observer.disconnect();
+        shadowObservers.delete(root);
+        actionRoots.delete(root);
+        const style = root.querySelector('#' + ACTION_STYLE_ID);
+        if (style) style.remove();
+    }
+
+    function bindActionMenu(host, root) {
+        if (!root) return;
+        const prev = actionMenus.get(root);
+        if (prev && prev.host === host && prev.trigger && prev.menu
+            && prev.trigger.isConnected && prev.menu.isConnected && prev.boundary.isConnected) return;
+        const menu = root.querySelector('bili-comment-menu');
+        if (!menu) return;
+
+        // 优先使用原生 ARIA 关系；当前B站模板没有 ARIA 时，再按“按钮与菜单的最近共同容器”发现。
+        let trigger = null;
+        const menuId = menu.id;
+        if (menuId) {
+            trigger = Array.from(root.querySelectorAll('[aria-controls]'))
+                .find((el) => el.getAttribute('aria-controls') === menuId) || null;
+        }
+        if (!trigger) {
+            const buttons = Array.from(root.querySelectorAll('button, [role="button"]'))
+                .filter((el) => !menu.contains(el));
+            trigger = buttons.find((el) => el.parentElement && el.parentElement.contains(menu))
+                || buttons[buttons.length - 1] || null;
+        }
+        if (!trigger) return;
+
+        let boundary = menu.parentElement;
+        while (boundary && boundary !== root && !boundary.contains(trigger)) boundary = boundary.parentElement;
+        if (!boundary || !boundary.contains(trigger)) boundary = root;
+
+        unbindActionMenu(root);
+
+        const record = { host, root, trigger, menu, boundary };
+        record.close = () => closeActionMenu(record);
+        record.open = () => {
+            if (openActionMenu && openActionMenu !== record) closeActionMenu(openActionMenu);
+            openActionMenu = record;
+        };
+        // B站把 mouseleave 绑在零尺寸的菜单宿主上，实际移出弹窗时不会触发。
+        record.leave = (event) => {
+            if (event.relatedTarget && isInsideActionMenu(event.relatedTarget, boundary, menu)) return;
+            record.close();
+        };
+        boundary.addEventListener('mouseleave', record.leave);
+        trigger.addEventListener('click', record.open);
+        menu.addEventListener('select', record.close);
+        actionMenus.set(root, record);
+    }
+
+    function onActionMenuOutside(event) {
+        const record = openActionMenu;
+        if (!record) return;
+        const path = event.composedPath ? event.composedPath() : [event.target];
+        if (path.includes(record.boundary) || path.includes(record.menu) || path.includes(record.trigger)) return;
+        record.close();
+    }
+
+    function onActionMenuKeydown(event) {
+        if (event.key === 'Escape' && openActionMenu) openActionMenu.close();
+    }
+
+    function installActionMenuGuards() {
+        document.addEventListener('pointerdown', onActionMenuOutside, true);
+        document.addEventListener('keydown', onActionMenuKeydown, true);
+    }
+
+    function clearCommentShadowState() {
+        for (const root of Array.from(actionRoots)) forgetActionRoot(root);
+        for (const observer of shadowObservers.values()) observer.disconnect();
+        shadowObservers.clear();
+        actionRoots.clear();
+        if (openActionMenu) closeActionMenu(openActionMenu);
+        openActionMenu = null;
+        if (shadowStyleEl) shadowStyleEl.remove();
+        shadowStyleEl = null;
+        observedShadowRoot = null;
+        lastShadowScanAt = 0;
+    }
+
     function syncCommentShadowStyle() {
         const bc = getCommentComp();          // 缓存：常态下这里不再有全文档查询
         const sr = bc && bc.shadowRoot;
-        if (!sr) return;
-        if (!layoutEnabled) {
-            // 原布局下还给B站：优先用缓存里的那份，省掉一次 shadow 内查询
-            const st = (shadowStyleEl && shadowStyleEl.isConnected)
-                ? shadowStyleEl : sr.querySelector('#bctr-shadow-style');
-            if (st) st.remove();
-            shadowStyleEl = null;
-            if (actionStyleActive) {
-                eachActionRoot(sr, (root) => {
-                    const s = root && root.querySelector('#' + ACTION_STYLE_ID);
-                    if (s) s.remove();
-                });
-                actionStyleActive = false;
-            }
+        if (!layoutEnabled || !sr) {
+            clearCommentShadowState();
             return;
         }
-        // 动作条样式只在评论页签露脸时有意义；新翻出来的评论由每秒体检补上
-        if (activeTab === 'comment') {
-            eachActionRoot(sr, injectActionStyle);
-            actionStyleActive = true;
+        if (sr !== observedShadowRoot) {
+            clearCommentShadowState();
+            observedShadowRoot = sr;
+            observeShadowRoot(sr);
+            scanShadowNodes(sr.children);
+            lastShadowScanAt = Date.now();
         }
-        // 缓存命中就直接 return：旧版每秒都往 shadow 里 querySelector 一次
+
+        // 自定义元素可能晚于插入才挂载 shadow root；5 秒一次兜底发现这种节点。
+        const now = Date.now();
+        if (now - lastShadowScanAt >= 5000) {
+            scanShadowNodes(sr.children);
+            for (const [root, observer] of shadowObservers) {
+                if (root.host && root.host.isConnected) continue;
+                observer.disconnect();
+                shadowObservers.delete(root);
+                if (actionRoots.has(root)) forgetActionRoot(root);
+            }
+            lastShadowScanAt = now;
+        }
+        if (activeTab === 'comment') syncActionRoots();
+
+        // 缓存命中直接返回；兼容没有 ShadowRoot.getElementById 的内核。
         if (shadowStyleEl && shadowStyleEl.isConnected && shadowStyleEl.parentNode === sr) return;
-        // 用 querySelector 而不是 getElementById，兼容性更稳（老内核 ShadowRoot 上没有 getElementById）
         const existing = sr.querySelector('#bctr-shadow-style');
         if (existing) { shadowStyleEl = existing; return; }
         const st = document.createElement('style');
@@ -1448,15 +1629,16 @@
     // 指针停在滑块上：闲置淡出必须让路，否则鼠标刚移上去滑块就没了，永远抓不住
     let sbHover = false;
     // 上一次写进 DOM 的几何值：没变就不写，省掉无谓的样式失效
-    const sbGeom = { top: -1, height: -1, thumbH: -1, y: -1 };
+    const sbGeom = { body: null, top: -1, height: -1, scrollHeight: -1, thumbH: -1, y: -1 };
 
     function resetSbGeom() {
-        sbGeom.top = sbGeom.height = sbGeom.thumbH = sbGeom.y = -1;
+        sbGeom.body = null;
+        sbGeom.top = sbGeom.height = sbGeom.scrollHeight = sbGeom.thumbH = sbGeom.y = -1;
     }
 
-    // 滚动 / resize 这类高频事件走 rAF 合并，一帧最多算一次（旧版每个 scroll 事件都同步读一次布局）。
+    // 高频滚动/resize 合帧计算，避免每个事件都同步读布局。
     // 非 overlay 模式的判定放在 updateOverlayScrollbar 内部（它会顺手清掉 .show），这里只管合帧。
-    const scheduleOverlayUpdate = coalesceRaf(updateOverlayScrollbar);
+    const scheduleOverlayUpdate = coalesceRaf(() => updateOverlayScrollbar(false));
 
     function showSbThumb() {
         const track = document.getElementById(CONFIG.sbTrackId);
@@ -1475,7 +1657,7 @@
         if (track && !sbDragging && !sbHover) track.classList.remove('show');
     }
 
-    function updateOverlayScrollbar() {
+    function updateOverlayScrollbar(measureGeometry = true) {
         const track = document.getElementById(CONFIG.sbTrackId);
         const thumb = document.getElementById(CONFIG.sbThumbId);
         if (!track || !thumb) return;
@@ -1487,9 +1669,14 @@
         // 评论页签未选中时 #commentapp 也已经是 0 高，走下面的 sh<=ch 分支自动隐藏
         if (body === getTabIntro() && body.hidden) { track.classList.remove('show'); return; }
 
-        const sh = body.scrollHeight;
-        const ch = body.clientHeight;
-        const top = body.offsetTop;
+        const reuseGeometry = !measureGeometry && sbGeom.body === body && sbGeom.height >= 0;
+        const sh = reuseGeometry ? sbGeom.scrollHeight : body.scrollHeight;
+        const ch = reuseGeometry ? sbGeom.height : body.clientHeight;
+        const top = reuseGeometry ? sbGeom.top : body.offsetTop;
+        if (!reuseGeometry) {
+            sbGeom.body = body;
+            sbGeom.scrollHeight = sh;
+        }
         // 轨道位置只在面板尺寸变化时才需要重写
         if (top !== sbGeom.top || ch !== sbGeom.height) {
             sbGeom.top = top;
@@ -1531,7 +1718,7 @@
                 showSbThumb();
             }
         }, { passive: true, capture: true });
-        panel.addEventListener('mouseenter', () => { scheduleOverlayUpdate(); showSbThumb(); });
+        panel.addEventListener('mouseenter', () => { updateOverlayScrollbar(); showSbThumb(); });
         panel.addEventListener('mouseleave', hideSbThumb);
 
         // 悬停期间不许淡出（showSbThumb 的 900ms 计时器看 sbHover）；
@@ -1576,33 +1763,12 @@
         });
     }
 
-    /* ================= 反自动画中画 / 迷你播放器 =================
-       症状：每次打开视频页，视频跑到右下角小窗里播放，左边主播放区一片黑。
-       成因：B站在"播放器不在视口内"时会自动进入画中画（原生画中画开关）或迷你播放器。
-       本布局把整页钉死在一屏内，任何一次 document 滚动（评论区 scrollIntoView、
-       浏览器滚动位置恢复、点击输入框聚焦滚动等）都会让播放器"离开视口"，
-       而 html/body 又是 overflow:hidden，用户无法滚回来 → 小窗再也退不掉。
-       对策：①钉住 document 滚动位置 ②关掉浏览器的自动画中画开关 ③已经进了就退出来。
-       ⚠ 播放器全屏（含网页全屏 / 浏览器真全屏）期间这三条一律停手：那时B站自己的排版与
-         "原生画中画"设置才是主体，脚本不去改 autoPictureInPicture、也不强制退出 PiP/小窗
-         （见 isPlayerFullscreen）。退出全屏后下一次体检自动恢复防黑屏逻辑。
-
-       📌 为什么没有「拦截 requestPictureInPicture」这一层（v1.3.5 删除）：
-       本脚本声明了 @grant GM_*，Tampermonkey/Violentmonkey 会把它放进【隔离世界】执行。
-       2026 真机实测（CDP 自建隔离世界 + 真实视频页）：
-         · 在隔离世界 patch HTMLVideoElement.prototype.requestPictureInPicture 后，
-           隔离世界自己看得到补丁（true），但【主世界看不到】（false）——页面脚本调用
-           B站的 PiP 时走的是页面自己的原型，压根不经过这个补丁；
-         · 同一环境下 window.BiliComments / window.bbComment 是 undefined、
-           customElements.get('bili-comments') 是 false（自定义元素注册表也是按世界隔离的）。
-       也就是说按当前 @grant 发布形态，那层原型拦截永远拦不到B站的自动画中画，纯属死代码，
-       还平白给页面加了个原型副作用；真正起作用的是下面两条 DOM 级手段：
-         · disableAutoPipFlag()  —— 把 video.autoPictureInPicture 置 false（写真实 DOM 属性，跨世界有效）
-         · exitAutoMiniPip() + enterpictureinpicture 监听 —— 已经进了就退出（同理跨世界有效） */
+    /* 单屏布局会触发B站离屏自动 PiP：锁住页面滚动、关闭自动 PiP，并退出已进入的小窗。
+       全屏时全部让路。隔离世界 patch 不到页面原型，因此只使用跨世界有效的 DOM 属性和事件。 */
 
     const PIP_GESTURE_WINDOW = 3000; // ms：距上次真实用户操作超过这个时长，视为"自动"触发
     // data-screen 的合法取值：只有 mini（及未知值）需要复位，其余保持原样
-    const PIP_NORMAL_SCREENS = [null, '', 'normal', 'wide', 'full', 'web'];
+    const PIP_NORMAL_SCREENS = ['normal', 'wide'];
     let lastUserInputAt = 0;
 
     function markUserInput() { lastUserInputAt = Date.now(); }
@@ -1615,7 +1781,7 @@
     // 快速路径：先只读一次全局滚动量；页面本来就不滚动时（99% 的体检）一个容器都不用碰，
     // 避免每秒白读 5 个元素的 scrollTop（那会强制一次布局）。
     function pinDocumentScroll() {
-        if (!layoutEnabled) return;
+        if (!layoutEnabled || !layoutCanApply()) return;
         if (!window.scrollY && !document.documentElement.scrollTop && !document.body.scrollTop) return;
         if (document.documentElement.scrollTop) document.documentElement.scrollTop = 0;
         if (document.body.scrollTop) document.body.scrollTop = 0;
@@ -1632,7 +1798,7 @@
     // 视频元素走缓存，不再每秒 querySelectorAll('video')。
     // 全屏期间不碰：那时"原生画中画"该由B站自己的设置决定（退出全屏后下一次体检补上）。
     function disableAutoPipFlag() {
-        if (!layoutEnabled) return;
+        if (!layoutEnabled || !layoutCanApply()) return;
         if (isPlayerFullscreen()) return;
         const vids = getVideoEls();
         for (const v of vids) {
@@ -1647,7 +1813,7 @@
 
     // 已经掉进小窗/画中画里就拉回来（全屏期间不干这事，见上面的 ⚠）
     function exitAutoMiniPip() {
-        if (!layoutEnabled) return false;
+        if (!layoutEnabled || !layoutCanApply()) return false;
         if (isPlayerFullscreen()) return false;
         let recovered = false;
         const auto = !isUserInitiated();
@@ -1805,12 +1971,12 @@
 
     function onPlayerWheel(e) {
         if (!wheelVolumeEnabled || !layoutEnabled) return;
+        if (!isPointerOnPlayer(e.target) || !layoutCanApply()) return;
         // 横向滚轮（触控板左右滑）不碰音量，也不拦，留给B站/浏览器
         if (!e.deltaY || Math.abs(e.deltaY) < Math.abs(e.deltaX)) return;
         // 全屏：完全放行给B站自带的滚轮音量，顺手清掉累积量，
         // 免得退出全屏后第一格先补上全屏期间攒下的零头
         if (isPlayerFullscreen()) { wheelAccum = 0; return; }
-        if (!isPointerOnPlayer(e.target)) return;
         const video = getWheelVideoEl();
         if (!video) return;
 
@@ -1868,6 +2034,7 @@
 
     function setLayoutEnabled(on, persist) {
         layoutEnabled = !!on;
+        if (!layoutEnabled) layoutGraceUntil = 0;
         buildLayoutStyle();
         applyWidths();
         if (layoutEnabled) {
@@ -1882,9 +2049,11 @@
         updateOverlayScrollbar();
         pinDocumentScroll();
         exitAutoMiniPip();
-        updatePlayerLayout(true);
-        scheduleFollowUpResizes();
-        if (layoutEnabled) positionHandle();
+        if (!layoutEnabled || layoutCanApply()) {
+            updatePlayerLayout(true);
+            scheduleFollowUpResizes();
+        }
+        if (layoutEnabled && layoutCanApply()) positionHandle();
         hideVolumeOsd();    // 关掉布局后滚轮不再调音量，提示条也别留着
         wheelAccum = 0;
         if (persist) GM_setValue('clientLayout', layoutEnabled);
@@ -1947,10 +2116,7 @@
         if (persist) GM_setValue('rightWidthPercent', rightPercent);
     }
 
-    // 非拖拽时按实测几何摆手柄（兼容B站任意内边距/间隙）。
-    // 只在布局变化 / 尺寸变化 / 拖拽结束时调用，不再每秒读一次布局。
-    // 手柄挂在面板左边缘（面板本身是 body 层悬浮层、位置固定），所以不再需要量位置；
-    // 只在面板被重建、手柄丢了的时候补挂一次。
+    // 手柄随面板左边缘移动；只需在面板重建后补挂，不必测量位置。
     function positionHandle() {
         if (!dragHandle || !layoutEnabled) return;
         const panel = getPanel();
@@ -1958,9 +2124,7 @@
         if (dragHandle.parentNode !== panel) panel.appendChild(dragHandle);
     }
 
-    /* 拖拽用 Pointer Events + setPointerCapture：
-       鼠标拖到窗口外、拖到播放器上、甚至触控笔/手指拖动都不会丢事件；
-       旧版只挂 document 的 mousemove，滑出窗口后要靠 blur 兜底收尾。 */
+    // Pointer Capture 保证指针移出窗口或播放器后拖拽事件不丢失。
     function onDragStart(e) {
         if (!dragHandle || (e.button !== undefined && e.button !== 0)) return;
         const vdcon = getVdcon();
@@ -2008,7 +2172,7 @@
             dragHandle.removeEventListener('lostpointercapture', onDragEnd);
         }
         document.documentElement.classList.remove('bctr-dragging');
-        setRightPercent(rightPercent, true);  // 落盘，并按实测几何重新摆一次手柄
+        setRightPercent(rightPercent, true); // 落盘并同步手柄。
         log('右栏宽度已保存:', Math.round(rightPercent) + '%');
     }
 
@@ -2083,8 +2247,7 @@
         // 挂载点也缓存：每秒一次 querySelector 换成引用比较
         let mount = nodeCache.toggleMount;
         if (!mount || !mount.isConnected || nodeCache.toggleMountType !== pageType) {
-            // 同一页型下"挂载点不存在"走负缓存：B站有些页面类型压根没有这个工具栏，
-            // 旧写法会每秒拿一个长选择器全文档查一遍
+            // 不存在的挂载点走负缓存，避免体检反复查询。
             if (nodeCache.toggleMountType === pageType && !mount && missCooling('toggleMount')) return;
             const isList = pageType === 'list';
             mount = document.querySelector(
@@ -2110,7 +2273,6 @@
         syncToggleButtonState(toggleBtn);
         toggleBtn.addEventListener('click', () => {
             setLayoutEnabled(!layoutEnabled, true);
-            syncToggleButtonState(toggleBtn);
         });
 
         mount.appendChild(toggleBtn);
@@ -2215,8 +2377,7 @@
         });
     }
 
-    // 禁用标题超链接（仅 /list/ 页面）；幂等，可以放在定时体检里反复调。
-    // 缓存节点：这个函数每秒都被调一次，旧写法是每次都拿长选择器全文档查一遍。
+    // 仅 /list/ 禁用标题跳转；缓存节点，避免体检重复查询。
     let titleLinkEl = null;
 
     function disableTitleLink() {
@@ -2235,10 +2396,7 @@
         link.style.color = 'inherit';
     }
 
-    /* ================= 我们自己的节点 / 样式自愈 =================
-       体检每秒走一遍，全部是"引用比较 + isConnected"，常态零文档查询。
-       以前这几件事散落在 tick 末尾，而且漏了样式表本身：
-       B站重渲染把 <style> 删掉后，手柄 / ⇄ 按钮 / 音量提示条就永久没了样式（没人再补）。 */
+    // 仅做引用与连接状态检查，并补回被B站重渲染删除的样式和控件。
     function ensureOwnNodes() {
         ensureStaticStyle();          // 常驻样式（拖拽手柄 / ⇄ 按钮 / 音量提示条）
         ensureLayoutStyle();          // 客户端布局总样式
@@ -2247,11 +2405,172 @@
         syncCommentShadowStyle();     // 评论 shadow 内边距压缩
     }
 
-    // 布局样式被B站重渲染删掉时补回来：常态只有一次 isConnected 读，不重写样式文本
+    // 布局样式被B站重渲染删掉时补回来：锚点不完整时保持空样式，页面继续用B站原布局。
     function ensureLayoutStyle() {
         if (!layoutEnabled) return;
-        if (layoutStyleEl && layoutStyleEl.isConnected) return;
+        if (!layoutVisualsCanApply()) {
+            if (layoutStyleEl) layoutStyleEl.textContent = '';
+            return;
+        }
+        if (layoutStyleEl && layoutStyleEl.isConnected && layoutStyleEl.textContent) return;
         buildLayoutStyle();
+    }
+
+    /* ================= SPA 路由与页面壳观察 ================= */
+
+    function routeHasChanged() {
+        return window.location.pathname !== lastRoutePath || window.location.search !== lastRouteSearch;
+    }
+
+    function syncRouteComment() {
+        if (!layoutEnabled || !routeShellPending) return false;
+        const commentBody = getTabComment();
+        const vdcon = getVdcon();
+        if (!commentBody || !vdcon) return false;
+        const commentApp = vdcon.querySelector(CONFIG.commentAppSelector);
+        if (!commentApp || !commentApp.querySelector('bili-comments')) return false;
+        if (commentBody.contains(commentApp)) return false;
+        moveCommentAppIntoPanel(commentApp, commentBody);
+        if (resetCommentScrollOnReady) {
+            if (commentApp !== routeOldCommentApp) commentApp.scrollTop = 0;
+            resetCommentScrollOnReady = false;
+        }
+        removeWaitHint(commentBody);
+        switchTab(activeTab, true);
+        triggerCommentLazyLoad();
+        syncCommentShadowStyle();
+        return true;
+    }
+
+    function settleRouteShell() {
+        if (!routeShellPending) return;
+        const current = getVdcon();
+        const left = getLeftContainer();
+        const right = getRightContainer();
+        const currentCommentApp = current && current.querySelector(CONFIG.commentAppSelector);
+        const newCommentReady = routeOldCommentApp && currentCommentApp
+            && currentCommentApp !== routeOldCommentApp
+            && !!currentCommentApp.querySelector('bili-comments');
+        const shellChanged = !current || current !== routeOldVdcon
+            || (left && left !== routeOldLeft) || (right && right !== routeOldRight);
+        if (shellChanged && routeReusedCommentApp
+            && (!current || !current.contains(routeReusedCommentApp))) {
+            const reused = routeReusedCommentApp;
+            routeReusedCommentApp = null;
+            const commentBody = getTabComment();
+            if (commentBody && reused.parentNode === commentBody) {
+                reused.remove();
+                clearCommentShadowState();
+                ensureWaitHint();
+            }
+        }
+        if (shellChanged || newCommentReady || Date.now() >= routeShellDeadline) {
+            routeShellPending = false;
+            routeOldVdcon = routeOldLeft = routeOldRight = null;
+            markGeometryDirty();
+        }
+    }
+
+    function handleRouteChange() {
+        const oldVdcon = getVdcon();
+        const oldLeft = getLeftContainer();
+        const oldRight = getRightContainer();
+        const oldCommentBody = getTabComment();
+        const oldCommentApp = oldCommentBody && oldCommentBody.querySelector(CONFIG.commentAppSelector);
+        // DOM 可能先于 pushState 更新；用上一次观察到的壳作比较，避免把新壳误判成旧壳再空等。
+        const observedShell = observedVdcon || observedLeft || observedRight;
+        const restoreLeft = observedShell ? observedLeft : oldLeft;
+        const restoreRight = observedShell ? observedRight : oldRight;
+        const keepLayout = layoutEnabled && layoutVisualsCanApply();
+        lastRoutePath = window.location.pathname;
+        lastRouteSearch = window.location.search;
+        routeReusedCommentApp = null;
+        if (layoutEnabled) {
+            if (keepLayout) resetPanelForRoute({ left: restoreLeft, right: restoreRight });
+            else teardownPanel({ left: restoreLeft, right: restoreRight });
+        } else restoreAllMoved();
+        layoutGraceUntil = keepLayout ? Date.now() + CONFIG.routeLayoutGraceMs : 0;
+
+        elCache.vdcon = elCache.left = elCache.right = null;
+        elCache.panel = elCache.tabIntro = elCache.tabComment = null;
+        dropNodeCache();
+        guardCache.forEach((rec, key) => { if (!rec.node || !rec.node.isConnected) guardCache.delete(key); });
+        titleLinkEl = null;
+        resetCommentScrollOnReady = true;
+        routeOldVdcon = observedShell ? (observedVdcon || oldVdcon) : oldVdcon;
+        routeOldLeft = restoreLeft;
+        routeOldRight = restoreRight;
+        routeOldCommentApp = oldCommentApp;
+        routeShellPending = !!(routeOldVdcon || routeOldLeft || routeOldRight);
+        routeShellDeadline = Date.now() + 1500;
+        wheelAccum = 0;
+        hideVolumeOsd();
+        syncLayoutObservers();
+        applyWidths();
+        markGeometryDirty();
+    }
+
+    let routeObserver = null;
+    const checkRouteAndShell = coalesceRaf(() => {
+        if (document.hidden) return;
+        settleRouteShell();
+        if (routeHasChanged()) {
+            handleRouteChange();
+            return;
+        }
+        if (layoutEnabled && routeShellPending && syncRouteComment()) return;
+        // 评论组件挂载会改变 #commentapp 的子树，立即重试搬迁，不必等下一秒体检。
+        if (layoutEnabled && (!getPanel() || movesPending) && ensurePanel()) syncPanelContents();
+    });
+
+    function isUrgentRouteNode(node) {
+        if (node.nodeType !== 1) return false;
+        return node.id === 'mirror-vdcon' || node.id === 'playerWrap' || node.id === 'commentapp'
+            || node.localName === 'bili-comments'
+            || node.classList.contains('left-container') || node.classList.contains('right-container')
+            || !!node.querySelector('#mirror-vdcon, .left-container, .right-container, #playerWrap, #commentapp, bili-comments');
+    }
+
+    function routeMutationIsUrgent(records) {
+        for (const record of records) {
+            for (const nodes of [record.addedNodes, record.removedNodes]) {
+                for (const node of nodes) if (isUrgentRouteNode(node)) return true;
+            }
+        }
+        return false;
+    }
+
+    function installRouteObserver() {
+        if (window.MutationObserver) {
+            let pendingScanTimer = 0;
+            let lastPendingScanAt = 0;
+            routeObserver = new MutationObserver((records) => {
+                if (records.some((record) => record.target.id === 'commentapp')) resetSbGeom();
+                if (!movesPending) {
+                    clearTimeout(pendingScanTimer);
+                    pendingScanTimer = 0;
+                    checkRouteAndShell();
+                    return;
+                }
+                const elapsed = performance.now() - lastPendingScanAt;
+                if (routeMutationIsUrgent(records) || !lastPendingScanAt || elapsed >= 100) {
+                    clearTimeout(pendingScanTimer);
+                    pendingScanTimer = 0;
+                    lastPendingScanAt = performance.now();
+                    checkRouteAndShell();
+                } else if (!pendingScanTimer) {
+                    pendingScanTimer = setTimeout(() => {
+                        pendingScanTimer = 0;
+                        lastPendingScanAt = performance.now();
+                        checkRouteAndShell();
+                    }, 100 - elapsed);
+                }
+            });
+            routeObserver.observe(document.documentElement, { childList: true, subtree: true });
+        }
+        window.addEventListener('popstate', checkRouteAndShell);
+        window.addEventListener('hashchange', checkRouteAndShell);
+        window.addEventListener('pageshow', checkRouteAndShell);
     }
 
     /* ================= 定时体检 =================
@@ -2261,36 +2580,22 @@
     function tick() {
         if (document.hidden) return;   // 后台标签页不干活；回到前台会立刻补一次（见 visibilitychange）
 
-        // B站是 SPA：换视频不会重跑脚本，只能靠路由指纹发现
-        const pathname = window.location.pathname;
-        const search = window.location.search;
-        const routeChanged = pathname !== lastRoutePath || search !== lastRouteSearch;
-        if (routeChanged) {
-            lastRoutePath = pathname;
-            lastRouteSearch = search;
-            elCache.vdcon = elCache.left = elCache.right = null;
-            elCache.panel = elCache.tabIntro = elCache.tabComment = null;
-            dropNodeCache();
-            // 上一个视频里被搬移的节点已经脱离文档，继续留在 Map 里会拖着一整棵
-            // 已卸载的 DOM 不放（看几十个视频就是几十份泄漏），这里顺手清掉
-            movedOrigin.forEach((rec, node) => { if (!node.isConnected) movedOrigin.delete(node); });
-            guardCache.forEach((rec, key) => { if (!rec.node || !rec.node.isConnected) guardCache.delete(key); });
-            resetShellState();         // 新页面要重新等一次B站补全
-            wheelAccum = 0;            // 滚轮累积清零：新视频从B站自己的音量记忆重新开始
-            hideVolumeOsd();
-            syncLayoutObservers();
-            applyWidths();             // 右栏容器可能被换成新节点，行内宽度要补写
-            // 新视频的评论区从顶部开始看（否则会沿用上一个视频滚到的位置）
-            const cb = getTabComment();
-            if (cb && cb.scrollTop) cb.scrollTop = 0;
-            markGeometryDirty();
-        }
+        settleRouteShell();
+        // B站是 SPA：换视频不会重跑脚本，路由事件与 DOM 观察都会走这里。
+        const routeChanged = routeHasChanged();
+        if (routeChanged) handleRouteChange();
 
         disableTitleLink();            // 仅 /list/ 页面有效，幂等
         syncFullscreenClass();         // 全屏状态镜像（事件之外的兜底：一次属性读，值没变就返回）
         const playerFs = fsMirrorState === true;
 
-        if (layoutEnabled) {
+        if (layoutEnabled && !layoutVisualsCanApply()) {
+            teardownPanel();
+            if (layoutStyleEl) layoutStyleEl.textContent = '';
+            applyWidths();
+        }
+
+        if (layoutEnabled && layoutCanApply()) {
             pinDocumentScroll();       // 钉住滚动，杜绝自动画中画的触发条件（不滚动就直接返回）
 
             /* 播放器全屏期间：只留"钉住滚动"这一条，其它全部停手——
@@ -2353,6 +2658,8 @@
         // 全屏状态镜像（html.bctr-player-fs）：CSS 靠它决定要不要清理播放器链路，
         // tick / 画中画守卫靠它决定要不要让路给B站
         installFullscreenMirror();
+        installActionMenuGuards();
+        installRouteObserver();
 
         // 记录真实用户操作时间，用于区分"手动开小窗"与"页面自动开小窗"。
         // ⚠ 不含 wheel：滚轮滚动不算 userActivation，若把它算进来会让 isUserInitiated()

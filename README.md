@@ -2,7 +2,7 @@
 
 把 bilibili 视频页改成客户端式的单屏双栏：左栏播放器铺满视口高度，右栏是「简介 / 评论」选项卡面板，中间可拖拽调宽。整页不滚动，看视频和刷评论同时进行。
 
-Tampermonkey / Violentmonkey 用户脚本，当前版本 **1.4.6**。
+Tampermonkey / Violentmonkey 用户脚本，当前版本 **1.4.7**。
 
 发布源为本仓库；Greasy Fork 上的 [598035](https://greasyfork.org/scripts/598035) 作为镜像，从本仓库同步。
 
