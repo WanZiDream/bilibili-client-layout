@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站客户端双栏布局（评论区移到右侧，边看边刷评）
-// @namespace    https://github.com/yourname/bilibili-client-layout
-// @version      1.4.4
+// @namespace    https://github.com/WanZiDream/bilibili-client-layout
+// @version      1.4.5
 // @description  把B站视频页改成客户端式单屏双栏，可拖拽调宽、边看边评；鼠标停在画面上滚轮可调音量（全屏/网页全屏时播放器的一切都交还B站自带）。
 // @author       0WanZi
 // @license      MIT
@@ -11,8 +11,10 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
-// @downloadURL https://update.greasyfork.org/scripts/598035/B%E7%AB%99%E5%AE%A2%E6%88%B7%E7%AB%AF%E5%8F%8C%E6%A0%8F%E5%B8%83%E5%B1%80%EF%BC%88%E8%AF%84%E8%AE%BA%E5%8C%BA%E7%A7%BB%E5%88%B0%E5%8F%B3%E4%BE%A7%EF%BC%8C%E8%BE%B9%E7%9C%8B%E8%BE%B9%E5%88%B7%E8%AF%84%EF%BC%89.user.js
-// @updateURL https://update.greasyfork.org/scripts/598035/B%E7%AB%99%E5%AE%A2%E6%88%B7%E7%AB%AF%E5%8F%8C%E6%A0%8F%E5%B8%83%E5%B1%80%EF%BC%88%E8%AF%84%E8%AE%BA%E5%8C%BA%E7%A7%BB%E5%88%B0%E5%8F%B3%E4%BE%A7%EF%BC%8C%E8%BE%B9%E7%9C%8B%E8%BE%B9%E5%88%B7%E8%AF%84%EF%BC%89.meta.js
+// @homepageURL https://github.com/WanZiDream/bilibili-client-layout
+// @supportURL  https://github.com/WanZiDream/bilibili-client-layout/issues
+// @downloadURL https://raw.githubusercontent.com/WanZiDream/bilibili-client-layout/main/bilibili-client-layout.user.js
+// @updateURL   https://raw.githubusercontent.com/WanZiDream/bilibili-client-layout/main/bilibili-client-layout.user.js
 // ==/UserScript==
 
 (function() {

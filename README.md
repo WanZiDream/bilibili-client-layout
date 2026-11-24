@@ -2,16 +2,22 @@
 
 把 bilibili 视频页改成客户端式的单屏双栏：左栏播放器铺满视口高度，右栏是「简介 / 评论」选项卡面板，中间可拖拽调宽。整页不滚动，看视频和刷评论同时进行。
 
-Tampermonkey / Violentmonkey 用户脚本，当前版本 **1.4.4**。
+Tampermonkey / Violentmonkey 用户脚本，当前版本 **1.4.5**。
+
+发布源为本仓库；Greasy Fork 上的 [598035](https://greasyfork.org/scripts/598035) 作为镜像，从本仓库同步。
 
 ## 安装
 
 1. 先装一个用户脚本管理器：[Tampermonkey](https://www.tampermonkey.net/) 或 Violentmonkey。
-2. 任选一种方式安装本脚本：
-   - 从 Greasy Fork 安装（带自动更新）：<https://greasyfork.org/scripts/598035>
-   - 从本仓库安装：打开 [`bilibili-client-layout.user.js`](../../raw/main/bilibili-client-layout.user.js)，管理器会弹出安装确认页。
+2. 打开 [`bilibili-client-layout.user.js`](../../raw/main/bilibili-client-layout.user.js)，管理器会弹出安装确认页，点安装即可。
+
+装好后更新检查直接指向本仓库的 `main` 分支，发新版即自动更新。也可以从 Greasy Fork 镜像安装。
 
 生效页面：`www.bilibili.com/video/*` 与 `www.bilibili.com/list/*`（稍后再看、收藏夹、合集等二级播放页）。
+
+> **从 1.4.4 及更早版本升级的用户注意**：1.4.5 把 `@namespace` 从占位值改成了真实仓库地址。
+> 脚本管理器用「name + namespace」认脚本身份，namespace 变了会被当成**另一个脚本**。
+> 请先在管理器里**卸载旧的那一份**，再从上面重新安装，否则两份会同时运行（双面板、双 ⇄ 按钮）。
 
 ## 功能
 
