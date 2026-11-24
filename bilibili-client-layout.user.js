@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站客户端双栏布局（评论区移到右侧，边看边刷评）
 // @namespace    https://github.com/WanZiDream/bilibili-client-layout
-// @version      1.4.5
+// @version      1.4.6
 // @description  把B站视频页改成客户端式单屏双栏，可拖拽调宽、边看边评；鼠标停在画面上滚轮可调音量（全屏/网页全屏时播放器的一切都交还B站自带）。
 // @author       0WanZi
 // @license      MIT
@@ -1104,18 +1104,16 @@
                     const tab = e.target.closest('.bctr-tab');
                     if (tab) switchTab(tab.getAttribute('data-tab'));
                 });
-                // 键盘可达：←/→/Home/End 切页签，和原生 tablist 一致
+                // Home/End 切页签；左右方向键不拦截，留给B站播放器快进/后退。
                 bar.addEventListener('keydown', (e) => {
-                    const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+                    const keys = ['Home', 'End'];
                     if (keys.indexOf(e.key) === -1) return;
                     const tabs = Array.from(bar.querySelectorAll('.bctr-tab'));
                     if (!tabs.length) return;
                     e.preventDefault();
                     let i = tabs.indexOf(e.target.closest('.bctr-tab'));
                     if (i < 0) i = activeTab === 'intro' ? 0 : 1;
-                    if (e.key === 'ArrowLeft') i = (i + tabs.length - 1) % tabs.length;
-                    else if (e.key === 'ArrowRight') i = (i + 1) % tabs.length;
-                    else if (e.key === 'Home') i = 0;
+                    if (e.key === 'Home') i = 0;
                     else i = tabs.length - 1;
                     switchTab(tabs[i].getAttribute('data-tab'));
                     tabs[i].focus();
