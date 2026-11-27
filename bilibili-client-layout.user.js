@@ -23,43 +23,55 @@
     const DEBUG = false; // 正式保持关闭；开启后仅输出 [BCTR] 日志。
     function log()   { if (DEBUG) console.log.apply(console, ['[BCTR]'].concat([].slice.call(arguments))); }
 
-    // 新标准要求组件定义时自带 connectedMoveCallback；B站未实现，只在定义前补空回调。
-    // B站先绑定窗口滚动、后渲染 .trigger；等首次渲染后再让它建立原生续页观察器。
+    // moveBefore 的移动回调必须在组件定义前存在；其余兼容交给 MutationObserver。
     function installCommentCompatibility() {
         const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
         const registry = pageWindow.customElements;
-        if (!registry) return;
-        const originalDefine = registry.define;
-        if (originalDefine.bctrCommentCompatibility) return;
-        const define = function (name, constructor, options) {
-            if (name === 'bili-comments') {
-                const proto = constructor.prototype;
-                if (typeof pageWindow.Element.prototype.moveBefore === 'function' && !proto.connectedMoveCallback) {
-                    Object.defineProperty(proto, 'connectedMoveCallback', {
-                        configurable: true,
-                        value: function () {}
-                    });
+        if (registry && typeof pageWindow.Element.prototype.moveBefore === 'function' && !registry.define.bctrMoveCompatibility) {
+            const originalDefine = registry.define;
+            registry.define = function (name, constructor, options) {
+                if (name === 'bili-comments' || name === 'bili-avatar') {
+                    const proto = constructor.prototype;
+                    if (!proto.connectedMoveCallback) Object.defineProperty(proto, 'connectedMoveCallback', { configurable: true, value: function () {} });
                 }
-                const addLoadEvent = proto.addLoadEvent;
-                if (typeof addLoadEvent === 'function' && !addLoadEvent.bctrWaitForTrigger) {
-                    const pendingLoads = new WeakSet();
-                    const compatibleAddLoadEvent = function () {
-                        if (this.continueTrigger || !this.showContinueTrigger || !this.updateComplete || pendingLoads.has(this)) {
-                            return addLoadEvent.apply(this, arguments);
-                        }
-                        const args = arguments;
-                        pendingLoads.add(this);
-                        Promise.resolve(this.updateComplete).then(() => {
-                            pendingLoads.delete(this);
-                            if (this.isConnected) addLoadEvent.apply(this, args);
-                        });
-                    };
-                    compatibleAddLoadEvent.bctrWaitForTrigger = true;
-                    proto.addLoadEvent = compatibleAddLoadEvent;
-                }
+                return originalDefine.call(this, name, constructor, options);
+            };
+            registry.define.bctrMoveCompatibility = true;
+        }
+        const roots = new WeakSet();
+        const avatarPayloads = new WeakMap();
+        let avatarLoadPatched = false;
+        let commentGetListPatched = false;
+        const observer = new MutationObserver((records) => {
+            for (const record of records) for (const node of record.addedNodes) scan(node);
+        });
+
+        function adaptAvatar(avatar) {
+            if (!avatarLoadPatched) {
+                const proto = Object.getPrototypeOf(avatar);
+                const load = proto.load;
+                if (typeof load !== 'function') return;
+                const compatibleLoad = function (payload, config) {
+                    avatarPayloads.set(this, { payload, config });
+                    return load.apply(this, arguments);
+                };
+                proto.load = compatibleLoad;
+                avatarLoadPatched = true;
+            }
+            let saved = avatarPayloads.get(avatar);
+            const host = avatar.getRootNode()?.host;
+            if (!saved && host?.biliAvatar === avatar && host.data?.member) {
+                saved = { payload: host.avatarPayload, config: avatar.config || { baseSize: 48, isFloat: true, lazyload: true } };
+                if (saved.payload) avatarPayloads.set(avatar, saved);
+            }
+            if (saved?.payload && !avatar.loaded) avatar.load(saved.payload, saved.config);
+        }
+
+        function adaptComments(comments) {
+            if (!commentGetListPatched) {
+                const proto = Object.getPrototypeOf(comments);
                 const getList = proto.getList;
-                if (typeof getList === 'function' && !getList.bctrRetryEmptyHotPage) {
-                    // 热门接口偶尔连续返回空页但游标仍前进；最多补跑五次，避免用户来回滚动。
+                if (typeof getList === 'function') {
                     const compatibleGetList = function () {
                         this.__bctrEmptyHotRetryToken = null;
                         if (this.mode !== 3) this.__bctrEmptyHotRetries = 0;
@@ -79,7 +91,6 @@
                                 return;
                             }
                             this.__bctrEmptyHotRetries = retries + 1;
-                            // 补跑间隔保持原生“正在加载”，避免请求间隙闪烁。
                             const retryToken = {};
                             this.__bctrEmptyHotRetryToken = retryToken;
                             this.showContinuations = true;
@@ -93,14 +104,39 @@
                             });
                         });
                     };
-                    compatibleGetList.bctrRetryEmptyHotPage = true;
                     proto.getList = compatibleGetList;
+                    commentGetListPatched = true;
                 }
             }
-            return originalDefine.call(this, name, constructor, options);
-        };
-        define.bctrCommentCompatibility = true;
-        registry.define = define;
+            if (comments.__bctrLoadPreparing || comments.__bctrLoadPrepared || !comments.updateComplete || typeof comments.addLoadEvent !== 'function') return;
+            comments.__bctrLoadPreparing = true;
+            Promise.resolve(comments.updateComplete).then(() => {
+                comments.__bctrLoadPreparing = false;
+                if (comments.isConnected && comments.showContinueTrigger && comments.continueTrigger) {
+                    comments.addLoadEvent();
+                    comments.__bctrLoadPrepared = true;
+                }
+            });
+        }
+
+        function scan(node) {
+            if (node.nodeType !== 1) return;
+            if (node.localName === 'bili-avatar') adaptAvatar(node);
+            else if (node.localName === 'bili-comments') adaptComments(node);
+            else if (node.localName === 'bili-comment-action-buttons-renderer') node.style.whiteSpace = 'nowrap';
+            if (node.shadowRoot && (node.localName === 'bili-comments' || node.localName.includes('comment'))) observe(node.shadowRoot);
+            for (const child of node.children) scan(child);
+        }
+
+        function observe(root) {
+            if (!roots.has(root)) {
+                roots.add(root);
+                observer.observe(root, { childList: true, subtree: true });
+            }
+            for (const child of root.children) scan(child);
+        }
+
+        observe(document);
     }
     installCommentCompatibility();
 
@@ -1467,6 +1503,7 @@
         :host > * { white-space: nowrap !important; }
         :host > *:not(:first-child) { margin-left: 12px !important; }
         button { flex: 0 0 auto !important; }
+        #reply { flex: 0 0 auto !important; }
         :host > :last-child { margin-right: 0 !important; }
     `;
     // 按 root 记住塞进去的那份样式：常态每个 root 只剩一次 isConnected 读。

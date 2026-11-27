@@ -67,6 +67,25 @@
 </script>
 <script src="/bilibili-client-layout.user.js?v=regression"></script>
 <script>
+  class FixtureAvatar extends HTMLElement {
+    constructor() {
+      super();
+      this.loaded = false;
+      this.dataset.loadCalls = '0';
+      this.dataset.disconnects = '0';
+    }
+    load(payload, config) {
+      this.loaded = true;
+      this.config = config;
+      this.dataset.loadCalls = String(Number(this.dataset.loadCalls) + 1);
+      this.textContent = payload.face;
+    }
+    disconnectedCallback() {
+      this.loaded = false;
+      this.textContent = '';
+      this.dataset.disconnects = String(Number(this.dataset.disconnects) + 1);
+    }
+  }
   class FixtureComments extends HTMLElement {
     constructor() {
       super();
@@ -88,7 +107,10 @@
       return lazyScroll ? this.shadowRoot?.querySelector('.trigger') : null;
     }
     addLoadEvent() {
-      if (lazyScroll) this.dataset.loadBound = this.continueTrigger ? 'trigger' : 'window';
+      if (lazyScroll) {
+        this.dataset.loadEventCalls = String(Number(this.dataset.loadEventCalls || 0) + 1);
+        this.dataset.loadBound = this.continueTrigger ? 'trigger' : 'window';
+      }
     }
     async getList() {
       if (!lazyScroll) return;
@@ -129,10 +151,17 @@
     }
   }
   class FixtureComment extends HTMLElement {
+    constructor() {
+      super();
+      this.data = { member: {} };
+      this.avatarPayload = { face: 'avatar' };
+    }
     connectedCallback() {
       if (this.shadowRoot) return;
       const root = this.attachShadow({ mode: 'open' });
-      root.innerHTML = '<bili-comment-action-buttons-renderer></bili-comment-action-buttons-renderer>';
+      root.innerHTML = '<bili-avatar></bili-avatar><bili-comment-action-buttons-renderer></bili-comment-action-buttons-renderer>';
+      this.biliAvatar = root.querySelector('bili-avatar');
+      this.biliAvatar.load(this.avatarPayload, { baseSize: 48, isFloat: true, lazyload: true });
     }
   }
   class FixtureActions extends HTMLElement {
@@ -148,10 +177,11 @@
     connectedCallback() {
       if (this.shadowRoot) return;
       const root = this.attachShadow({ mode: 'open' });
-      root.innerHTML = '<div id="more"><button id="trigger">...</button><bili-comment-menu></bili-comment-menu></div><button id="reply">回复</button>';
+      root.innerHTML = '<div id="more"><button id="trigger">...</button><bili-comment-menu></bili-comment-menu></div><div id="reply"><button id="reply-button">回复</button></div>';
       root.querySelector('#trigger').addEventListener('click', () => { this.showMoreMenu = true; });
     }
   }
+  customElements.define('bili-avatar', FixtureAvatar);
   customElements.define('bili-comments', FixtureComments);
   customElements.define('bili-comment-thread-renderer', FixtureThread);
   customElements.define('bili-comment-renderer', FixtureComment);
@@ -308,9 +338,10 @@
 
   async function runLazyScroll() {
     const comments = document.querySelector('bili-comments');
-    await waitFor(() => !!comments.dataset.loadBound);
+    await waitFor(() => comments.dataset.loadBound === 'trigger');
     assert(comments.dataset.loadBound === 'trigger', 'lazy-scroll: native continuation observer waits for the rendered trigger', {
-      loadBound: comments.dataset.loadBound
+      loadBound: comments.dataset.loadBound,
+      loadEventCalls: comments.dataset.loadEventCalls
     });
     await comments.getList();
     assert(comments.dataset.getListCalls === '6' && comments.list.length === 1, 'lazy-scroll: empty hot pages retry up to five times through native getList', {
@@ -343,6 +374,16 @@
       listLength: comments.list.length,
       retries: comments.__bctrEmptyHotRetries
     });
+    const loadEventCalls = comments.dataset.loadEventCalls;
+    const toggle = document.querySelector('.comment-toggle-btn');
+    toggle.click();
+    await waitFor(() => leftApp() === allApps()[0]);
+    toggle.click();
+    await waitFor(() => panelApps()[0] === allApps()[0]);
+    assert(comments.dataset.loadEventCalls === loadEventCalls, 'lazy-scroll: moving comments does not duplicate native load listeners', {
+      before: loadEventCalls,
+      after: comments.dataset.loadEventCalls
+    });
   }
 
   async function runBasic() {
@@ -350,19 +391,35 @@
     assert(allApps().length === 1 && panelApps().length === 1, 'basic: one comment container');
     const commentApp = allApps()[0];
     const comments = commentApp.querySelector('bili-comments');
+    const avatar = comments.shadowRoot
+      .querySelector('bili-comment-thread-renderer').shadowRoot
+      .querySelector('bili-comment-renderer').shadowRoot
+      .querySelector('bili-avatar');
     const expectedConnects = legacyMove ? ['2', '3', '4'] : ['1', '1', '1'];
     const expectedDisconnects = legacyMove ? ['1', '2', '3'] : ['0', '0', '0'];
     assert(comments.dataset.connects === expectedConnects[0] && comments.dataset.disconnects === expectedDisconnects[0], 'basic: moving comments uses the expected lifecycle', {
       connects: comments.dataset.connects,
       disconnects: comments.dataset.disconnects
     });
+    assert(avatar.loaded && avatar.textContent === 'avatar', 'basic: avatar survives the initial comment move', {
+      loaded: avatar.loaded,
+      loadCalls: avatar.dataset.loadCalls
+    });
     const toggle = document.querySelector('.comment-toggle-btn');
     toggle.click();
     await waitFor(() => leftApp() === commentApp);
     assert(comments.dataset.connects === expectedConnects[1] && comments.dataset.disconnects === expectedDisconnects[1], 'basic: restoring comments uses the expected lifecycle');
+    assert(avatar.loaded && avatar.textContent === 'avatar', 'basic: avatar survives restoring comments', {
+      loaded: avatar.loaded,
+      loadCalls: avatar.dataset.loadCalls
+    });
     toggle.click();
     await waitFor(() => panelApps()[0] === commentApp);
     assert(comments.dataset.connects === expectedConnects[2] && comments.dataset.disconnects === expectedDisconnects[2], 'basic: moving comments again uses the expected lifecycle');
+    assert(avatar.loaded && avatar.textContent === 'avatar', 'basic: avatar survives moving comments again', {
+      loaded: avatar.loaded,
+      loadCalls: avatar.dataset.loadCalls
+    });
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
     assert(document.querySelector('video').dataset.currentTime === '5', 'basic: arrow key seeks video');
     assert(document.querySelector('.bctr-tab.active').dataset.tab === 'comment', 'basic: arrow key keeps comment tab');
@@ -379,6 +436,13 @@
       .querySelector('bili-comment-thread-renderer').shadowRoot
       .querySelector('bili-comment-renderer').shadowRoot
       .querySelector('bili-comment-action-buttons-renderer');
+    await waitFor(() => !!actions.shadowRoot.querySelector('#bctr-action-style'));
+    const reply = actions.shadowRoot.querySelector('#reply');
+    assert(actions.style.whiteSpace === 'nowrap' && getComputedStyle(reply).flexShrink === '0', 'basic: reply stays on one line in a narrow comment panel', {
+      hostWhiteSpace: actions.style.whiteSpace,
+      replyFlexShrink: getComputedStyle(reply).flexShrink,
+      buttonWhiteSpace: getComputedStyle(reply.querySelector('button')).whiteSpace
+    });
     actions.shadowRoot.querySelector('#trigger').click();
     assert(actions.dataset.menuOpen === 'true', 'basic: native comment menu opens');
     document.querySelector('#playerWrap').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, composed: true }));
