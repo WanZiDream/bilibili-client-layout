@@ -24,6 +24,9 @@
   const params = new URLSearchParams(location.search);
   const testCase = params.get('case') || 'history-first';
   const introMode = testCase === 'intro-lazy';
+  const lazyScroll = testCase === 'lazy-scroll';
+  const legacyMove = params.get('legacyMove') === '1';
+  if (legacyMove) delete Element.prototype.moveBefore;
   const results = [];
   const startedAt = performance.now();
   let scrollEvents = 0;
@@ -61,12 +64,61 @@
     event.preventDefault();
     video.dataset.currentTime = String(Math.max(0, Number(video.dataset.currentTime || 0) + (event.key === 'ArrowRight' ? 5 : -5)));
   });
-
+</script>
+<script src="/bilibili-client-layout.user.js?v=regression"></script>
+<script>
   class FixtureComments extends HTMLElement {
+    constructor() {
+      super();
+      this.dataset.connects = '0';
+      this.dataset.disconnects = '0';
+      if (lazyScroll) {
+        this.showContinueTrigger = true;
+        this.updateComplete = new Promise((resolve) => { this.finishUpdate = resolve; });
+        this.mode = 3;
+        this.list = [];
+        this.paginationStr = '0';
+        this.showEnd = false;
+        this.showSpinner = false;
+        this.showContinuations = false;
+        this.dataset.getListCalls = '0';
+      }
+    }
+    get continueTrigger() {
+      return lazyScroll ? this.shadowRoot?.querySelector('.trigger') : null;
+    }
+    addLoadEvent() {
+      if (lazyScroll) this.dataset.loadBound = this.continueTrigger ? 'trigger' : 'window';
+    }
+    async getList() {
+      if (!lazyScroll) return;
+      const initiallyLoading = this.showSpinner;
+      this.dataset.getListCalls = String(Number(this.dataset.getListCalls) + 1);
+      this.paginationStr = String(Number(this.paginationStr) + 1);
+      this.showSpinner = true;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (this.mode === 3 && Number(this.dataset.getListCalls) >= 6) this.list.push({ rpid_str: String(this.dataset.getListCalls) });
+      if (Number(this.dataset.getListCalls) === 1) {
+        setTimeout(() => { this.dataset.continuationsDuringDelay = String(this.showContinuations); }, 60);
+      }
+      if (!initiallyLoading) this.showSpinner = false;
+    }
     connectedCallback() {
+      this.dataset.connects = String(Number(this.dataset.connects) + 1);
+      if (lazyScroll) this.addLoadEvent();
       if (this.shadowRoot) return;
       const root = this.attachShadow({ mode: 'open' });
+      if (lazyScroll) {
+        queueMicrotask(() => {
+          root.innerHTML = '<div class="trigger"></div>';
+          this.finishUpdate();
+        });
+        return;
+      }
       root.innerHTML = '<bili-comment-thread-renderer></bili-comment-thread-renderer>';
+    }
+    disconnectedCallback() {
+      this.dataset.disconnects = String(Number(this.dataset.disconnects) + 1);
     }
   }
   class FixtureThread extends HTMLElement {
@@ -198,6 +250,21 @@
     assert(movedAt - mountedAt < 250, 'history-first: ready comment moves promptly', { delayMs: Math.round(movedAt - mountedAt) });
   }
 
+  async function runHintReuse() {
+    pushRoute('BVHINT1');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await wait(50);
+    resetShell('BVHINT1', true);
+    await waitFor(() => !!document.querySelector('#bctr-tab-comment .bctr-wait-hint'));
+    const hint = document.querySelector('#bctr-tab-comment .bctr-wait-hint');
+    pushRoute('BVHINT2');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await wait(50);
+    resetShell('BVHINT2', true);
+    await wait(50);
+    assert(document.querySelector('#bctr-tab-comment .bctr-wait-hint') === hint, 'hint-reuse: waiting hint node survives route reset');
+  }
+
   async function runDomFirst() {
     const oldApp = panelApps()[0];
     pushRoute('BVDOM');
@@ -231,7 +298,7 @@
     const oldApp = panelApps()[0];
     pushRoute('BVINTRO');
     resetShell('BVINTRO', true);
-    await waitFor(() => panelApps().length === 1 && panelApps()[0] !== oldApp && panelApps()[0].querySelector('bili-comments'));
+    await waitFor(() => panelApps().length === 1 && panelApps()[0] !== oldApp && panelApps()[0].querySelector('bili-comments'), 3000);
     await wait(100);
     const before = scrollEvents;
     document.querySelector('.bctr-tab[data-tab="comment"]').click();
@@ -239,9 +306,63 @@
     assert(scrollEvents > before, 'intro-lazy: switching to visible comment triggers lazy load', { before, after: scrollEvents });
   }
 
+  async function runLazyScroll() {
+    const comments = document.querySelector('bili-comments');
+    await waitFor(() => !!comments.dataset.loadBound);
+    assert(comments.dataset.loadBound === 'trigger', 'lazy-scroll: native continuation observer waits for the rendered trigger', {
+      loadBound: comments.dataset.loadBound
+    });
+    await comments.getList();
+    assert(comments.dataset.getListCalls === '6' && comments.list.length === 1, 'lazy-scroll: empty hot pages retry up to five times through native getList', {
+      calls: comments.dataset.getListCalls,
+      listLength: comments.list.length
+    });
+    assert(comments.dataset.continuationsDuringDelay === 'true', 'lazy-scroll: native loading indicator stays visible between retries', {
+      continuationsDuringDelay: comments.dataset.continuationsDuringDelay
+    });
+    comments.mode = 3;
+    comments.list = [];
+    comments.paginationStr = '0';
+    comments.showEnd = false;
+    comments.showContinuations = false;
+    comments.showSpinner = true;
+    comments.__bctrEmptyHotRetries = 0;
+    await comments.getList();
+    assert(comments.dataset.getListCalls === '7' && comments.showSpinner, 'lazy-scroll: initial loading does not start empty-page retries', {
+      calls: comments.dataset.getListCalls,
+      spinner: comments.showSpinner
+    });
+    comments.showSpinner = false;
+    comments.mode = 2;
+    comments.list = [];
+    comments.paginationStr = '0';
+    comments.__bctrEmptyHotRetries = 0;
+    await comments.getList();
+    assert(comments.dataset.getListCalls === '8' && comments.list.length === 0 && comments.__bctrEmptyHotRetries === 0, 'lazy-scroll: latest mode keeps native single-request behavior', {
+      calls: comments.dataset.getListCalls,
+      listLength: comments.list.length,
+      retries: comments.__bctrEmptyHotRetries
+    });
+  }
+
   async function runBasic() {
     assert(document.querySelectorAll('#bctr-panel').length === 1, 'basic: panel exists');
     assert(allApps().length === 1 && panelApps().length === 1, 'basic: one comment container');
+    const commentApp = allApps()[0];
+    const comments = commentApp.querySelector('bili-comments');
+    const expectedConnects = legacyMove ? ['2', '3', '4'] : ['1', '1', '1'];
+    const expectedDisconnects = legacyMove ? ['1', '2', '3'] : ['0', '0', '0'];
+    assert(comments.dataset.connects === expectedConnects[0] && comments.dataset.disconnects === expectedDisconnects[0], 'basic: moving comments uses the expected lifecycle', {
+      connects: comments.dataset.connects,
+      disconnects: comments.dataset.disconnects
+    });
+    const toggle = document.querySelector('.comment-toggle-btn');
+    toggle.click();
+    await waitFor(() => leftApp() === commentApp);
+    assert(comments.dataset.connects === expectedConnects[1] && comments.dataset.disconnects === expectedDisconnects[1], 'basic: restoring comments uses the expected lifecycle');
+    toggle.click();
+    await waitFor(() => panelApps()[0] === commentApp);
+    assert(comments.dataset.connects === expectedConnects[2] && comments.dataset.disconnects === expectedDisconnects[2], 'basic: moving comments again uses the expected lifecycle');
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
     assert(document.querySelector('video').dataset.currentTime === '5', 'basic: arrow key seeks video');
     assert(document.querySelector('.bctr-tab.active').dataset.tab === 'comment', 'basic: arrow key keeps comment tab');
@@ -271,20 +392,25 @@
     document.querySelector('.left-container').prepend(player);
     await wait(1100);
     assert(document.querySelectorAll('#bctr-panel').length === 1 && document.querySelectorAll('#playerWrap').length === 1, 'basic: layout recovers after player reinsert');
+    const upPanel = document.querySelector('#bctr-tab-intro .up-panel-container');
+    upPanel.remove();
+    await waitFor(() => document.querySelector('#bctr-tab-intro .up-panel-container') === upPanel, 2500);
+    assert(document.querySelector('#bctr-tab-intro .up-panel-container') === upPanel, 'basic: healer restores a detached native node');
   }
 
   resetShell('video-A');
   history.replaceState({}, '', '/video/BVINITIAL/');
 </script>
-<script src="/bilibili-client-layout.user.js?v=regression"></script>
 <script>
   (async () => {
     try {
       await waitFor(() => !!document.querySelector('#bctr-panel'), 3000);
       if (testCase === 'history-first') await runHistoryFirst();
+      else if (testCase === 'hint-reuse') await runHintReuse();
       else if (testCase === 'dom-first') await runDomFirst();
       else if (testCase === 'reuse') await runReuse();
       else if (testCase === 'intro-lazy') await runIntroLazy();
+      else if (testCase === 'lazy-scroll') await runLazyScroll();
       else await runBasic();
     } catch (error) {
       results.push({ name: 'unexpected', pass: false, details: error.message });

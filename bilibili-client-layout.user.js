@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         B站客户端双栏布局（评论区移到右侧，边看边刷评）
 // @namespace    https://github.com/WanZiDream/bilibili-client-layout
-// @version      1.4.7
+// @version      1.4.8
 // @description  把B站视频页改成客户端式单屏双栏，可拖拽调宽、边看边评；鼠标停在画面上滚轮可调音量（全屏/网页全屏时播放器的一切都交还B站自带）。
 // @author       0WanZi
 // @license      MIT
 // @match        *://www.bilibili.com/video/*
 // @match        *://www.bilibili.com/list/*
-// @run-at       document-end
+// @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
@@ -22,6 +22,87 @@
 
     const DEBUG = false; // 正式保持关闭；开启后仅输出 [BCTR] 日志。
     function log()   { if (DEBUG) console.log.apply(console, ['[BCTR]'].concat([].slice.call(arguments))); }
+
+    // 新标准要求组件定义时自带 connectedMoveCallback；B站未实现，只在定义前补空回调。
+    // B站先绑定窗口滚动、后渲染 .trigger；等首次渲染后再让它建立原生续页观察器。
+    function installCommentCompatibility() {
+        const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        const registry = pageWindow.customElements;
+        if (!registry) return;
+        const originalDefine = registry.define;
+        if (originalDefine.bctrCommentCompatibility) return;
+        const define = function (name, constructor, options) {
+            if (name === 'bili-comments') {
+                const proto = constructor.prototype;
+                if (typeof pageWindow.Element.prototype.moveBefore === 'function' && !proto.connectedMoveCallback) {
+                    Object.defineProperty(proto, 'connectedMoveCallback', {
+                        configurable: true,
+                        value: function () {}
+                    });
+                }
+                const addLoadEvent = proto.addLoadEvent;
+                if (typeof addLoadEvent === 'function' && !addLoadEvent.bctrWaitForTrigger) {
+                    const pendingLoads = new WeakSet();
+                    const compatibleAddLoadEvent = function () {
+                        if (this.continueTrigger || !this.showContinueTrigger || !this.updateComplete || pendingLoads.has(this)) {
+                            return addLoadEvent.apply(this, arguments);
+                        }
+                        const args = arguments;
+                        pendingLoads.add(this);
+                        Promise.resolve(this.updateComplete).then(() => {
+                            pendingLoads.delete(this);
+                            if (this.isConnected) addLoadEvent.apply(this, args);
+                        });
+                    };
+                    compatibleAddLoadEvent.bctrWaitForTrigger = true;
+                    proto.addLoadEvent = compatibleAddLoadEvent;
+                }
+                const getList = proto.getList;
+                if (typeof getList === 'function' && !getList.bctrRetryEmptyHotPage) {
+                    // 热门接口偶尔连续返回空页但游标仍前进；最多补跑五次，避免用户来回滚动。
+                    const compatibleGetList = function () {
+                        this.__bctrEmptyHotRetryToken = null;
+                        if (this.mode !== 3) this.__bctrEmptyHotRetries = 0;
+                        const beforeLength = this.list?.length || 0;
+                        const beforePagination = this.paginationStr;
+                        return Promise.resolve(getList.apply(this, arguments)).then(() => {
+                            if (this.mode !== 3 || this.showEnd || this.showSpinner || this.showContinuations) return;
+                            const listLength = this.list?.length || 0;
+                            if (listLength > beforeLength) {
+                                this.__bctrEmptyHotRetries = 0;
+                                return;
+                            }
+                            if (this.paginationStr === beforePagination) return;
+                            const retries = this.__bctrEmptyHotRetries || 0;
+                            if (retries >= 5) {
+                                this.__bctrEmptyHotRetries = 0;
+                                return;
+                            }
+                            this.__bctrEmptyHotRetries = retries + 1;
+                            // 补跑间隔保持原生“正在加载”，避免请求间隙闪烁。
+                            const retryToken = {};
+                            this.__bctrEmptyHotRetryToken = retryToken;
+                            this.showContinuations = true;
+                            return new Promise((resolve) => setTimeout(resolve, 120)).then(() => {
+                                if (this.__bctrEmptyHotRetryToken !== retryToken) return;
+                                this.__bctrEmptyHotRetryToken = null;
+                                this.showContinuations = false;
+                                if (this.isConnected && this.mode === 3 && !this.showEnd && !this.showSpinner && !this.showContinuations) {
+                                    return compatibleGetList.call(this);
+                                }
+                            });
+                        });
+                    };
+                    compatibleGetList.bctrRetryEmptyHotPage = true;
+                    proto.getList = compatibleGetList;
+                }
+            }
+            return originalDefine.call(this, name, constructor, options);
+        };
+        define.bctrCommentCompatibility = true;
+        registry.define = define;
+    }
+    installCommentCompatibility();
 
     // 页面间是 SPA 跳转，路由须实时读取。
     function isListPage() {
@@ -1021,13 +1102,19 @@
 
     /* ================= 节点搬移 / 归位 ================= */
 
+    // 已连接节点优先保活移动；未连接节点和旧浏览器仍走 insertBefore。
+    function insertNode(node, parent, before = null) {
+        if (node.isConnected && parent.isConnected && typeof parent.moveBefore === 'function') parent.moveBefore(node, before);
+        else parent.insertBefore(node, before);
+    }
+
     function moveNodeInto(node, target) {
         if (!node || !target || node.parentNode === target) return;
         const rec = movedOrigin.get(node);
         if (!rec || !document.body.contains(rec.parent)) {
             movedOrigin.set(node, { parent: node.parentNode, next: node.nextSibling });
         }
-        target.appendChild(node);
+        insertNode(node, target);
     }
 
     function restoreAllMoved(scope) {
@@ -1037,7 +1124,7 @@
                 || (scope.right && (scope.right === rec.parent || scope.right.contains(rec.parent))))) return;
             if (rec.parent && document.body.contains(rec.parent)) {
                 const next = rec.next && rec.next.parentNode === rec.parent ? rec.next : null;
-                rec.parent.insertBefore(node, next);
+                insertNode(node, rec.parent, next);
             }
         });
         movedOrigin.clear();
@@ -1156,6 +1243,7 @@
         switchTab(activeTab, true);
         updateOverlayScrollbar();
         syncCommentShadowStyle();
+        createToggleButton();
     }
 
     /* 等B站 hydration：评论组件是左栏最后一项，提前搬走前面的 SSR 节点会使后续对位错乱，
@@ -1243,7 +1331,6 @@
         shellHardDeadline = 0;
         shellInjectionOk = false;
         movesPending = false;
-        removeWaitHint();
     }
 
     // 每秒体检：只读登记表里节点的 isConnected / parentNode，不做任何文档查询
@@ -1301,7 +1388,8 @@
             movesPending = true;
             appliedTab = '';
             const intro = getTabIntro();
-            if (intro) intro.replaceChildren();
+            const introHints = intro ? Array.from(intro.querySelectorAll('.bctr-wait-hint')) : [];
+            if (intro) intro.replaceChildren(...introHints);
             let preservedCommentApp = false;
             if (commentBody) {
                 if (previousCommentApp && previousCommentApp.isConnected
@@ -1310,7 +1398,8 @@
                     routeReusedCommentApp = previousCommentApp;
                     preservedCommentApp = true;
                 } else {
-                    commentBody.replaceChildren();
+                    const commentHints = Array.from(commentBody.querySelectorAll('.bctr-wait-hint'));
+                    commentBody.replaceChildren(...commentHints);
                 }
             }
             if (preservedCommentApp) syncCommentShadowStyle();
@@ -2366,7 +2455,7 @@
                 const node = cached && cached.node;
                 if (node && !document.body.contains(node) && document.body.contains(parent)) {
                     const next = cached.next && cached.next.parentNode === parent ? cached.next : null;
-                    parent.insertBefore(node, next);
+                    insertNode(node, parent, next);
                     guardCache.set(g.sel, { node, parent, next });
                     log('节点被B站重渲染吞掉，已自愈恢复:', g.sel);
                 } else {
@@ -2725,10 +2814,14 @@
             '；右栏宽度', Math.round(rightPercent) + '%');
     }
 
-    // 启动脚本
-    try {
-        init();
-    } catch (error) {
-        console.error('[BCTR] 脚本初始化失败:', error);
-    }
+    // document-start 只为提前接入评论组件定义；布局初始化仍等页面壳就绪。
+    const start = () => {
+        try {
+            init();
+        } catch (error) {
+            console.error('[BCTR] 脚本初始化失败:', error);
+        }
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+    else start();
 })();
